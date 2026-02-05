@@ -22,21 +22,31 @@ classifiers = [
 ]
 
 dependencies = [
-    "pandas", 
-    "pytest", "pytest-cov", "pytest-timeout", "pytest-html",
-    "openai >= 1.65", 
+    "pandas",
+    "pytest",
+    "pytest-cov",
+    "pytest-timeout",
+    "pytest-html",
+    "openai>=1.65",
     "httpx",
     "tiktoken",
     "msal",
-    "rich", "requests", "chevron",
-    "llama-index", "llama-index-embeddings-huggingface", "llama-index-readers-web", "llama-index-embeddings-azure-openai",
-    "pypandoc", "docx", "markdown",
+    "rich",
+    "requests",
+    "chevron",
+    "llama-index",
+    "llama-index-embeddings-huggingface",
+    "llama-index-readers-web",
+    "llama-index-embeddings-azure-openai",
+    "pypandoc",
+    "docx",
+    "markdown",
     "jupyter",
     "matplotlib",
     "pydantic>=2.5.0",
     "pypandoc",
     "textdistance",
-    "scipy"
+    "scipy",
 ]
 
 [project.urls]
