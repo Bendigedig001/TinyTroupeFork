@@ -141,6 +141,13 @@ class ConfigManager:
             "MAX_CONTENT_DISPLAY_LENGTH", 1024
         )
 
+        prompt_cache_retention = config["OpenAI"].get(
+            "PROMPT_CACHE_RETENTION", ""
+        ).strip()
+        self._config["prompt_cache_retention"] = (
+            prompt_cache_retention if prompt_cache_retention else None
+        )
+
         self._config["parallel_agent_actions"] = config["Simulation"].getboolean(
             "PARALLEL_AGENT_ACTIONS", True
         )

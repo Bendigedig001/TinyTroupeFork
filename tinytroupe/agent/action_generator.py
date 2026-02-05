@@ -9,6 +9,17 @@ from tinytroupe.utils import JsonSerializableRegistry
 from tinytroupe.validation import propositions
 
 
+def _normalize_messages_for_llm(current_messages: list) -> list:
+    normalized = []
+    for msg in current_messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            normalized.append({"role": msg["role"], "content": content})
+        else:
+            normalized.append({"role": msg["role"], "content": json.dumps(content)})
+    return normalized
+
+
 class ActionGenerator(JsonSerializableRegistry):
 
     def __init__(
@@ -144,10 +155,7 @@ class ActionGenerator(JsonSerializableRegistry):
         )  # import here to avoid circular import issues
 
         # clean up (remove unnecessary elements) and copy the list of current messages to avoid modifying the original ones
-        current_messages = [
-            {"role": msg["role"], "content": json.dumps(msg["content"])}
-            for msg in current_messages
-        ]
+        current_messages = _normalize_messages_for_llm(current_messages)
 
         # starts with no feedback
         cur_feedback = None
@@ -331,10 +339,7 @@ class ActionGenerator(JsonSerializableRegistry):
             logger,
         )  # import here to avoid circular import issues
 
-        current_messages = [
-            {"role": msg["role"], "content": json.dumps(msg["content"])}
-            for msg in current_messages
-        ]
+        current_messages = _normalize_messages_for_llm(current_messages)
 
         cur_feedback = None
         all_negative_feedbacks = []
@@ -549,9 +554,13 @@ class ActionGenerator(JsonSerializableRegistry):
                 response_format = CognitiveActionsModel
             else:
                 response_format = CognitiveActionModel
+            cache_params = utils.prompt_cache_params_for_family(
+                "action_generator:next_action"
+            )
             next_message = await client().send_message_async(
                 current_messages_context,
                 response_format=response_format,
+                **cache_params,
             )
         else:
             current_messages_context.append(
@@ -564,9 +573,13 @@ class ActionGenerator(JsonSerializableRegistry):
                 response_format = CognitiveActionsModelWithReasoning
             else:
                 response_format = CognitiveActionModelWithReasoning
+            cache_params = utils.prompt_cache_params_for_family(
+                "action_generator:next_action"
+            )
             next_message = await client().send_message_async(
                 current_messages_context,
                 response_format=response_format,
+                **cache_params,
             )
 
         logger.debug(f"[{agent.name}] Received message: {next_message}")
@@ -853,8 +866,13 @@ class ActionGenerator(JsonSerializableRegistry):
                 response_format = CognitiveActionsModel
             else:
                 response_format = CognitiveActionModel
+            cache_params = utils.prompt_cache_params_for_family(
+                "action_generator:next_action"
+            )
             next_message = client().send_message(
-                current_messages_context, response_format=response_format
+                current_messages_context,
+                response_format=response_format,
+                **cache_params,
             )
 
         else:
@@ -868,9 +886,13 @@ class ActionGenerator(JsonSerializableRegistry):
                 response_format = CognitiveActionsModelWithReasoning
             else:
                 response_format = CognitiveActionModelWithReasoning
+            cache_params = utils.prompt_cache_params_for_family(
+                "action_generator:next_action"
+            )
             next_message = client().send_message(
                 current_messages_context,
                 response_format=response_format,
+                **cache_params,
             )
 
         logger.debug(f"[{agent.name}] Received message: {next_message}")

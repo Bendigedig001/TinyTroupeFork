@@ -20,12 +20,35 @@ def inject_html_css_style_prefix(html, style_prefix_attributes):
     """
     return html.replace('style="', f'style="{style_prefix_attributes};')
 
-def break_text_at_length(text: Union[str, dict], max_length: int=None) -> str:
+def break_text_at_length(text: Union[str, dict, list], max_length: int=None) -> str:
     """
     Breaks the text (or JSON) at the specified length, inserting a "(...)" string at the break point.
     If the maximum length is `None`, the content is returned as is.
     """
-    if isinstance(text, dict):
+    if isinstance(text, list):
+        text_chunks = []
+        image_count = 0
+        other_count = 0
+        for part in text:
+            if isinstance(part, dict):
+                part_type = part.get("type")
+                if part_type in {"text", "input_text"}:
+                    text_chunks.append(str(part.get("text", "")))
+                elif part_type in {"image_url", "input_image"}:
+                    image_count += 1
+                else:
+                    other_count += 1
+            else:
+                other_count += 1
+        summary = "\n".join([t for t in text_chunks if t.strip()])
+        if image_count:
+            suffix = f"[Attached images: {image_count}]"
+            summary = f"{summary}\n{suffix}" if summary else suffix
+        if other_count:
+            suffix = f"[Other parts: {other_count}]"
+            summary = f"{summary}\n{suffix}" if summary else suffix
+        text = summary
+    elif isinstance(text, dict):
         text = json.dumps(text, indent=4)
 
     if max_length is None or len(text) <= max_length:
@@ -109,4 +132,3 @@ class RichTextStyle:
         
         elif kind == "intervention":
             return cls.INTERVENTION_DEFAULT_STYLE
-

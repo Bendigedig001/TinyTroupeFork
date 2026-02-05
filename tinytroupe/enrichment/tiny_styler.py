@@ -54,7 +54,12 @@ class TinyStyler(JsonSerializableRegistry):
             system_template_name="styler.system.mustache",
             user_template_name="styler.user.mustache",
             base_module_folder="enrichment",
-            temperature=temperature
+            temperature=temperature,
+            prompt_family=utils.prompt_cache_family_from_templates(
+                "styler.system.mustache",
+                "styler.user.mustache",
+                base_module_folder="enrichment",
+            ),
         )
         
         # Call the model and get the response
@@ -84,4 +89,61 @@ class TinyStyler(JsonSerializableRegistry):
         else:
             # Fallback: return original content when LLM fails
             logger.warning(f"LLM returned None for styling. Returning original content.")
+            return content
+
+    async def apply_style_async(
+        self,
+        content: str,
+        style: str,
+        content_type: str = None,
+        context_info: str = "",
+        context_cache: list = None,
+        verbose: bool = False,
+        temperature: float = 0.7,
+    ):
+        if context_cache is None and self.use_past_results_in_context:
+            context_cache = self.context_cache
+
+        rendering_configs = {
+            "content": content,
+            "style": style,
+            "content_type": content_type,
+            "context_info": context_info,
+            "context_cache": context_cache,
+        }
+
+        chat = LLMChat(
+            system_template_name="styler.system.mustache",
+            user_template_name="styler.user.mustache",
+            base_module_folder="enrichment",
+            temperature=temperature,
+            prompt_family=utils.prompt_cache_family_from_templates(
+                "styler.system.mustache",
+                "styler.user.mustache",
+                base_module_folder="enrichment",
+            ),
+        )
+
+        result = await chat.call_async(**rendering_configs)
+
+        debug_msg = f"Styling result: {result}"
+        logger.debug(debug_msg)
+        if verbose:
+            print(debug_msg)
+
+        if result is not None:
+            styled_content = utils.extract_code_block(result)
+            if not styled_content:
+                styled_content = result
+
+            if self.use_past_results_in_context:
+                self.context_cache.append(
+                    {"original": content, "style": style, "styled": styled_content}
+                )
+
+            return styled_content
+        else:
+            logger.warning(
+                "LLM returned None for styling. Returning original content."
+            )
             return content

@@ -2,6 +2,7 @@ import ast
 import asyncio
 import copy
 import functools
+import hashlib
 import inspect
 import json
 import os
@@ -21,6 +22,84 @@ from tinytroupe.utils.rendering import break_text_at_length
 # Model input utilities
 ################################################################################
 
+PROMPT_CACHE_KEY_VERSION = "v1"
+
+
+def _short_hash(value: str, length: int = 12) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+
+
+def prompt_cache_family_from_templates(
+    system_template_name: str,
+    user_template_name: str | None = None,
+    base_module_folder: str | None = None,
+) -> str:
+    """
+    Builds a stable prompt family identifier from template names.
+    """
+    base = base_module_folder or "core"
+    return f"tpl:{base}:{system_template_name or '-'}:{user_template_name or '-'}"
+
+
+def build_prompt_cache_key(prompt_family: str) -> str:
+    """
+    Builds a stable prompt cache key for OpenAI prompt caching.
+    """
+    family = " ".join(prompt_family.strip().split())
+    if len(family) > 180:
+        family = f"{family[:120]}:{_short_hash(family)}"
+    return f"tt:{PROMPT_CACHE_KEY_VERSION}:{family}"
+
+
+def _normalize_prompt_cache_retention(retention: str | None) -> str | None:
+    if retention is None:
+        return None
+    normalized = retention.strip().lower()
+    if normalized in {"in_memory", "24h"}:
+        return normalized
+    logger.warning(
+        "Ignoring invalid prompt_cache_retention value '%s' (expected 'in_memory' or '24h').",
+        retention,
+    )
+    return None
+
+
+def prompt_cache_params_for_family(
+    prompt_family: str | None,
+    prompt_cache_key: str | None = None,
+    prompt_cache_retention: str | None = None,
+) -> dict:
+    """
+    Returns prompt caching params for OpenAI calls (key + retention).
+    """
+    try:
+        from tinytroupe import config_manager  # avoid circular imports
+
+        if config_manager.get("api_type") != "openai":
+            return {}
+    except Exception:
+        return {}
+
+    params: dict = {}
+
+    if prompt_cache_key is None and prompt_family:
+        prompt_cache_key = build_prompt_cache_key(prompt_family)
+    if prompt_cache_key:
+        params["prompt_cache_key"] = prompt_cache_key
+
+    if prompt_cache_retention is None:
+        try:
+            from tinytroupe import config_manager  # avoid circular imports
+
+            prompt_cache_retention = config_manager.get("prompt_cache_retention")
+        except Exception:
+            prompt_cache_retention = None
+
+    prompt_cache_retention = _normalize_prompt_cache_retention(prompt_cache_retention)
+    if prompt_cache_retention:
+        params["prompt_cache_retention"] = prompt_cache_retention
+
+    return params
 
 def compose_initial_LLM_messages_with_templates(
     system_template_name: str,
@@ -142,6 +221,7 @@ class LLMChat:
         enable_json_output_format: bool = True,
         enable_justification_step: bool = True,
         enable_reasoning_step: bool = False,
+        prompt_family: str | None = None,
         **model_params,
     ):
         """
@@ -190,7 +270,9 @@ class LLMChat:
         self.enable_justification_step = enable_justification_step
         self.enable_json_output_format = enable_json_output_format
 
+        self.prompt_family = prompt_family
         self.model_params = model_params
+        self._apply_prompt_cache_defaults()
 
         # Conversation history
         self.messages = []
@@ -203,6 +285,47 @@ class LLMChat:
         self.response_value = None
         self.response_justification = None
         self.response_confidence = None
+
+    def _derive_prompt_family(self) -> str | None:
+        if self.system_template_name or self.user_template_name:
+            return prompt_cache_family_from_templates(
+                self.system_template_name,
+                self.user_template_name,
+                base_module_folder=self.base_module_folder,
+            )
+        return None
+
+    def _apply_prompt_cache_defaults(self) -> None:
+        try:
+            from tinytroupe import config_manager  # avoid circular imports
+
+            if config_manager.get("api_type") != "openai":
+                self.model_params.pop("prompt_cache_key", None)
+                self.model_params.pop("prompt_cache_retention", None)
+                return
+        except Exception:
+            pass
+
+        if "prompt_cache_key" not in self.model_params or self.model_params.get(
+            "prompt_cache_key"
+        ) is None:
+            prompt_family = self.prompt_family or self._derive_prompt_family()
+            cache_params = prompt_cache_params_for_family(prompt_family)
+            self.model_params.update(cache_params)
+            return
+
+        # If a key is provided, still allow default retention.
+        if "prompt_cache_retention" not in self.model_params or self.model_params.get(
+            "prompt_cache_retention"
+        ) is None:
+            cache_params = prompt_cache_params_for_family(
+                prompt_family=None,
+                prompt_cache_key=self.model_params.get("prompt_cache_key"),
+            )
+            if "prompt_cache_retention" in cache_params:
+                self.model_params["prompt_cache_retention"] = cache_params[
+                    "prompt_cache_retention"
+                ]
 
     def __call__(self, *args, **kwds):
         return self.call(*args, **kwds)
@@ -335,6 +458,15 @@ class LLMChat:
 
         self.messages.append({"role": "assistant", "content": content})
         return self
+
+    def _insert_typing_instruction(self, instruction: dict) -> None:
+        """
+        Insert a system typing instruction near the start to maximize prompt caching.
+        """
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages.insert(1, instruction)
+        else:
+            self.messages.insert(0, instruction)
 
     def set_model_params(self, **model_params):
         """
@@ -537,7 +669,7 @@ class LLMChat:
                                     f"Unsupported output type: {current_output_type}"
                                 )
 
-                            self.messages.append(typing_instruction)
+                            self._insert_typing_instruction(typing_instruction)
 
                     else:  # output_type is None
                         self.model_params["response_format"] = None
@@ -547,7 +679,7 @@ class LLMChat:
                             + "The needs of the user have changed. You **must** now use regular text -- not numbers, not booleans, not JSON. "
                             + "There are no fields, no types, no special formats. Just regular text appropriate to respond to the last user request.",
                         }
-                        self.messages.append(typing_instruction)
+                        self._insert_typing_instruction(typing_instruction)
                         # pass  # nothing here for now
 
             # Call the LLM model with all messages in the conversation
@@ -863,7 +995,7 @@ class LLMChat:
                                     f"Unsupported output type: {current_output_type}"
                                 )
 
-                            self.messages.append(typing_instruction)
+                            self._insert_typing_instruction(typing_instruction)
 
                     else:  # output_type is None
                         self.model_params["response_format"] = None
@@ -873,7 +1005,7 @@ class LLMChat:
                             + "The needs of the user have changed. You **must** now use regular text -- not numbers, not booleans, not JSON. "
                             + "There are no fields, no types, no special formats. Just regular text appropriate to respond to the last user request.",
                         }
-                        self.messages.append(typing_instruction)
+                        self._insert_typing_instruction(typing_instruction)
 
             # Call the LLM model with all messages in the conversation
             model_output = await client().send_message_async(
@@ -1384,10 +1516,10 @@ def llm(
 
                 user_prompt = f"Execute the above computation as best as you can using the following input parameter values and respecting the output format defined by the computation specification. Produce the requested output even if it is very long.\n"
                 user_prompt += (
-                    f" ## Unnamed parameters\n{json.dumps(args, indent=4)}\n\n"
+                    f" ## Unnamed parameters\n{json.dumps(args, indent=4, sort_keys=True)}\n\n"
                 )
                 user_prompt += (
-                    f" ## Named parameters\n{json.dumps(kwargs, indent=4)}\n\n"
+                    f" ## Named parameters\n{json.dumps(kwargs, indent=4, sort_keys=True)}\n\n"
                 )
 
                 user_prompt += (
@@ -1403,6 +1535,11 @@ def llm(
                 # uses the returned function as a post-processing function
                 postprocessing_func = result
 
+            model_params = dict(model_overrides)
+            prompt_family = model_params.pop("prompt_family", None)
+            if prompt_family is None and "prompt_cache_key" not in model_params:
+                prompt_family = f"llm:{func.__module__}.{func.__qualname__}"
+
             llm_req = LLMChat(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -1410,7 +1547,8 @@ def llm(
                 enable_json_output_format=enable_json_output_format,
                 enable_justification_step=enable_justification_step,
                 enable_reasoning_step=enable_reasoning_step,
-                **model_overrides,
+                prompt_family=prompt_family,
+                **model_params,
             )
 
             llm_result = postprocessing_func(llm_req.call())
@@ -1463,8 +1601,8 @@ def llm_async(
                 user_prompt = (
                     "Execute the above computation as best as you can using the following input parameter values and respecting the output format defined by the computation specification. Produce the requested output even if it is very long.\n"
                 )
-                user_prompt += f" ## Unnamed parameters\n{json.dumps(args, indent=4)}\n\n"
-                user_prompt += f" ## Named parameters\n{json.dumps(kwargs, indent=4)}\n\n"
+                user_prompt += f" ## Unnamed parameters\n{json.dumps(args, indent=4, sort_keys=True)}\n\n"
+                user_prompt += f" ## Named parameters\n{json.dumps(kwargs, indent=4, sort_keys=True)}\n\n"
                 user_prompt += (
                     " ## Output format\n"
                     "The output must be of type and format defined in the computation specification above.\n"
@@ -1474,6 +1612,11 @@ def llm_async(
             if inspect.isfunction(result):
                 postprocessing_func = result
 
+            model_params = dict(model_overrides)
+            prompt_family = model_params.pop("prompt_family", None)
+            if prompt_family is None and "prompt_cache_key" not in model_params:
+                prompt_family = f"llm:{func.__module__}.{func.__qualname__}"
+
             llm_req = LLMChat(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
@@ -1481,7 +1624,8 @@ def llm_async(
                 enable_json_output_format=enable_json_output_format,
                 enable_justification_step=enable_justification_step,
                 enable_reasoning_step=enable_reasoning_step,
-                **model_overrides,
+                prompt_family=prompt_family,
+                **model_params,
             )
 
             llm_value = await llm_req.call_async()

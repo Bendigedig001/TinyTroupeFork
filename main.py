@@ -24,6 +24,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
+from tinytroupe.utils.images import ImageSpec, build_image_content_part, preprocess_image_cached
+
 
 def uk_population_sample() -> dict[str, Any]:
     # This is intentionally small and human-readable (prompt context, not parsed programmatically).
@@ -99,24 +101,155 @@ def uk_population_sample() -> dict[str, Any]:
     }
 
 
-def default_question_and_options() -> tuple[str, list[str]]:
-    options = ["Tea", "Coffee", "Hot Chocolate"]
-    question = "\n".join(
+@dataclass(frozen=True)
+class ImageDefaults:
+    max_dim: int = 768
+    format: str = "jpeg"
+    quality: int = 85
+    detail: str = "low"
+
+
+@dataclass(frozen=True)
+class OptionSpec:
+    id: str
+    label: str
+    images: list[ImageSpec]
+
+
+def _default_option_specs() -> list[OptionSpec]:
+    labels = ["Tea", "Coffee", "Hot Chocolate"]
+    return [
+        OptionSpec(id=chr(65 + i), label=label, images=[])
+        for i, label in enumerate(labels)
+    ]
+
+
+def _build_question_text(
+    options: list[OptionSpec],
+    base_question: Optional[str] = None,
+    include_images_info: bool = False,
+) -> str:
+    total = len(options)
+    lines = [
+        base_question or "Quick preference question:",
+        f"Rank the following options from most preferred (rank 1) to least preferred (rank {total}).",
+        "Options:",
+    ]
+    for opt in options:
+        if include_images_info:
+            lines.append(f"- {opt.id}: {opt.label} ({len(opt.images)} image(s))")
+        else:
+            lines.append(f"- {opt.id}: {opt.label}")
+
+    if include_images_info:
+        lines.append(
+            "Images are attached below, grouped by option in the order listed; within each option they appear in the listed order."
+        )
+
+    lines.extend(
         [
-            "Quick preference question:",
-            "Rank the following options from most preferred (rank 1) to least preferred (rank 3).",
-            f"Options: {', '.join(options)}",
             "",
             "Reply ONLY with valid JSON in this shape:",
-            '{"ranking": ["Tea", "Coffee", "Hot Chocolate"], "why": "one short sentence"}',
+            json.dumps(
+                {"ranking": [opt.label for opt in options], "why": "one short sentence"},
+                ensure_ascii=False,
+            ),
             "",
             "Rules:",
-            "- Use the exact option strings as provided (case/spelling).",
+            "- Use the exact option labels as provided above (case/spelling).",
+            "- If you use option IDs instead of labels, use the IDs exactly as shown (e.g., A, B, C).",
             "- Include each option exactly once in the ranking list.",
             "- No extra keys, no markdown, no surrounding text.",
         ]
     )
+    return "\n".join(lines)
+
+
+def _load_options_spec(
+    path: Optional[str],
+    image_defaults: ImageDefaults,
+) -> tuple[Optional[str], list[OptionSpec]]:
+    if path is None:
+        return None, _default_option_specs()
+
+    payload = _read_json_file(path)
+    question = payload.get("question")
+    raw_options = payload.get("options")
+    if not isinstance(raw_options, list) or not raw_options:
+        raise ValueError("options JSON must include a non-empty 'options' list.")
+
+    options: list[OptionSpec] = []
+    for idx, opt in enumerate(raw_options):
+        if isinstance(opt, str):
+            label = opt
+            opt_id = chr(65 + idx)
+            images = []
+        elif isinstance(opt, dict):
+            label = opt.get("label") or opt.get("name") or opt.get("option")
+            if not label:
+                raise ValueError(f"Option at index {idx} missing label.")
+            opt_id = opt.get("id") or chr(65 + idx)
+            images = []
+            raw_images = opt.get("images") or []
+            if isinstance(raw_images, list):
+                for img in raw_images:
+                    if isinstance(img, str):
+                        img_spec = {"path": img}
+                    elif isinstance(img, dict):
+                        img_spec = img
+                    else:
+                        continue
+                    img_path = img_spec.get("path")
+                    if not img_path:
+                        continue
+                    images.append(
+                        ImageSpec(
+                            path=img_path,
+                            detail=img_spec.get("detail", image_defaults.detail),
+                            max_dim=int(img_spec.get("max_dim", image_defaults.max_dim)),
+                            format=img_spec.get("format", image_defaults.format),
+                            quality=int(img_spec.get("quality", image_defaults.quality)),
+                        )
+                    )
+        else:
+            raise ValueError(f"Unsupported option value at index {idx}.")
+
+        options.append(OptionSpec(id=str(opt_id), label=str(label), images=images))
+
     return question, options
+
+
+def _build_question_payload(
+    question_text: str,
+    options: list[OptionSpec],
+    cache_dir: str,
+) -> tuple[Any, list[dict]]:
+    has_images = any(opt.images for opt in options)
+    image_fingerprints: list[dict] = []
+    if not has_images:
+        return question_text, image_fingerprints
+
+    parts: list[dict] = []
+    for opt in options:
+        opt_images: list[dict] = []
+        for img in opt.images:
+            asset = preprocess_image_cached(img, cache_dir)
+            opt_images.append(
+                {
+                    "source_sha256": asset.source_sha256,
+                    "cache_key": asset.cache_key,
+                    "format": asset.format,
+                    "quality": asset.quality,
+                    "max_dim": asset.max_dim,
+                    "detail": img.detail,
+                }
+            )
+            parts.append(build_image_content_part(asset, detail=img.detail))
+        image_fingerprints.append(
+            {"id": opt.id, "label": opt.label, "images": opt_images}
+        )
+
+    return {"text": question_text, "parts": parts}, image_fingerprints
 
 
 def _norm(s: str) -> str:
@@ -144,8 +277,14 @@ def _write_json_file(path: str, obj: Any) -> None:
     os.replace(tmp, path)
 
 
-def _coerce_ranking(raw_ranking: Iterable[Any], options: list[str]) -> list[str]:
+def _coerce_ranking(
+    raw_ranking: Iterable[Any], options: list[str], aliases: Optional[dict[str, str]] = None
+) -> list[str]:
     canonical_by_norm = {_norm(opt): opt for opt in options}
+    if aliases:
+        for alias, target in aliases.items():
+            if target in options:
+                canonical_by_norm[_norm(alias)] = target
     ranking: list[str] = []
     for item in raw_ranking:
         if not isinstance(item, str):
@@ -299,12 +438,18 @@ def _persona_cache_key(
     return _sha256_text(_canonical_json(payload))
 
 
-def _answers_cache_key(personas_key: str, question: str, options: list[str]) -> str:
+def _answers_cache_key(
+    personas_key: str,
+    question_text: str,
+    options: list[str],
+    image_fingerprints: list[dict],
+) -> str:
     payload = {
-        "schema": "tinytroupe-uk-borda/answers/v1",
+        "schema": "tinytroupe-uk-borda/answers/v2",
         "personas_key": personas_key,
-        "question": question,
+        "question": question_text,
         "options": options,
+        "images": image_fingerprints,
     }
     return _sha256_text(_canonical_json(payload))
 
@@ -344,7 +489,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--parallel",
         action="store_true",
-        help="Parallelize independent LLM calls using true asyncio (persona generation + question answering).",
+        default=None,
+        help="Parallelize independent LLM calls using true asyncio (persona generation + question answering). Enabled by default in LLM mode.",
+    )
+    parser.add_argument(
+        "--no-parallel",
+        action="store_true",
+        help="Disable async parallelism even in LLM mode.",
     )
     parser.add_argument(
         "--max-workers",
@@ -357,6 +508,36 @@ def main(argv: Optional[list[str]] = None) -> int:
         type=int,
         default=2048,
         help="Max completion tokens for model calls (default: 2048).",
+    )
+    parser.add_argument(
+        "--options-json",
+        type=str,
+        default=None,
+        help="Path to JSON file defining the question/options/images (optional).",
+    )
+    parser.add_argument(
+        "--image-max-dim",
+        type=int,
+        default=768,
+        help="Max image dimension (longest side) when preprocessing (default: 768).",
+    )
+    parser.add_argument(
+        "--image-format",
+        type=str,
+        default="jpeg",
+        help="Image output format for preprocessing: jpeg, png, webp (default: jpeg).",
+    )
+    parser.add_argument(
+        "--image-quality",
+        type=int,
+        default=85,
+        help="Image quality for jpeg/webp preprocessing (default: 85).",
+    )
+    parser.add_argument(
+        "--image-detail",
+        type=str,
+        default="low",
+        help="OpenAI image detail parameter: low, high, auto (default: low).",
     )
     parser.add_argument(
         "--cache-dir",
@@ -391,12 +572,45 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("Use `--people 3` (default).", file=sys.stderr)
         return 2
 
-    question, options = default_question_and_options()
+    image_defaults = ImageDefaults(
+        max_dim=args.image_max_dim,
+        format=args.image_format,
+        quality=args.image_quality,
+        detail=args.image_detail,
+    )
+    try:
+        question_override, option_specs = _load_options_spec(args.options_json, image_defaults)
+    except Exception as exc:
+        _eprint(f"Failed to load options spec: {exc}")
+        return 2
+
+    if len(option_specs) != args.people:
+        _eprint("Options count must match --people for this demo.")
+        return 2
+
+    include_images_info = any(opt.images for opt in option_specs)
+    question_text = _build_question_text(
+        option_specs, base_question=question_override, include_images_info=include_images_info
+    )
+    try:
+        question_payload, image_fingerprints = _build_question_payload(
+            question_text, option_specs, args.cache_dir
+        )
+    except Exception as exc:
+        _eprint(f"Failed to preprocess images: {exc}")
+        return 2
+    options = [opt.label for opt in option_specs]
+    option_aliases = {opt.id: opt.label for opt in option_specs}
     persist = (not args.no_persist)
     refresh_personas = bool(args.refresh_personas)
     refresh_answers = bool(args.refresh_answers) or refresh_personas
     use_mock = _should_use_mock(args.mock)
     backend = "mock" if use_mock else "llm"
+    if backend == "llm":
+        if args.no_parallel:
+            args.parallel = False
+        elif args.parallel is None:
+            args.parallel = True
 
     if use_mock and not args.mock:
         _eprint(
@@ -428,7 +642,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     personas_meta_path = os.path.join(personas_dir, "meta.json")
     persona_paths = [os.path.join(personas_dir, f"person_{i+1}.agent.json") for i in range(args.people)]
 
-    answers_key = _answers_cache_key(personas_key=personas_key, question=question, options=options)
+    answers_key = _answers_cache_key(
+        personas_key=personas_key,
+        question_text=question_text,
+        options=options,
+        image_fingerprints=image_fingerprints,
+    )
     answers_path = os.path.join(args.cache_dir, "answers", f"{answers_key}.json")
 
     # If answers exist, we can short-circuit the whole run (default behavior).
@@ -438,10 +657,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             cached_responses = cached.get("responses")
             cached_options = cached.get("options")
             cached_question = cached.get("question")
+            cached_images = cached.get("images", [])
             if (
                 isinstance(cached_responses, list)
                 and cached_options == options
-                and cached_question == question
+                and cached_question == question_text
+                and cached_images == image_fingerprints
                 and len(cached_responses) == args.people
             ):
                 responses = [
@@ -671,7 +892,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                                 async with semaphore:
                                     actions = await asyncio.wait_for(
                                         person_obj.listen_and_act_async(
-                                            question,
+                                            question_payload,
                                             return_actions=True,
                                             communication_display=False,
                                         ),
@@ -710,7 +931,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                                 if raw_ranking is None:
                                     raw_ranking = options
 
-                                ranking = _coerce_ranking(raw_ranking, options)
+                                ranking = _coerce_ranking(raw_ranking, options, option_aliases)
                                 persona_summary = {
                                     k: person_obj.get(k)
                                     for k in [
@@ -879,7 +1100,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
                         def _ask_one():
                             return person_obj.listen_and_act(
-                                question,
+                                question_payload,
                                 return_actions=True,
                                 communication_display=False,
                             )
@@ -913,7 +1134,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         if raw_ranking is None:
                             raw_ranking = options
 
-                        ranking = _coerce_ranking(raw_ranking, options)
+                        ranking = _coerce_ranking(raw_ranking, options, option_aliases)
                         if not args.quiet:
                             _eprint(f"Ranking from {who}: {ranking}")
                         persona_summary = {
@@ -957,11 +1178,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         if persist and responses:
             try:
                 payload = {
-                    "schema": "tinytroupe-uk-borda/answers/v1",
+                    "schema": "tinytroupe-uk-borda/answers/v2",
                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "personas_key": personas_key,
-                    "question": question,
+                    "question": question_text,
                     "options": options,
+                    "images": image_fingerprints,
                     "responses": [
                         {
                             "name": r.name,
@@ -986,8 +1208,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     output = {
         "population": uk_population_sample(),
-        "question": question,
+        "question": question_text,
         "options": options,
+        "images": image_fingerprints,
         "responses": [
             {
                 "name": r.name,

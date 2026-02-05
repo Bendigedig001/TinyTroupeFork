@@ -810,8 +810,182 @@ class EpisodicConsolidator(MemoryProcessor):
             )
             return {"consolidation": consolidated_results}
 
+    async def process_async(
+        self,
+        memories: list,
+        timestamp: str = None,
+        context: Union[str, list, dict] = None,
+        persona: Union[str, dict] = None,
+        sequential: bool = True,
+    ) -> list:
+        logger.debug(
+            f"STARTING MEMORY CONSOLIDATION (ASYNC): {len(memories)} memories to consolidate"
+        )
+
+        enriched_context = (
+            f"CURRENT COGNITIVE CONTEXT OF THE AGENT: {context}"
+            if context
+            else "No specific context provided for consolidation."
+        )
+
+        max_word_count = 1000
+        total_word_count = self.count_memory_content_words(memories)
+
+        if total_word_count <= max_word_count:
+            result = await self._consolidate_async(
+                memories, timestamp, enriched_context, persona
+            )
+            logger.debug(f"Consolidated {len(memories)} memories into: {result}")
+            return result
+
+        logger.debug(
+            f"Total word count {total_word_count} exceeds {max_word_count}, breaking into batches"
+        )
+
+        consolidated_results = []
+        batch_memories = []
+        current_batch_word_count = 0
+
+        for memory in memories:
+            memory_word_count = self.count_memory_content_words([memory])
+
+            if current_batch_word_count + memory_word_count > max_word_count and batch_memories:
+                batch_result = await self._consolidate_async(
+                    batch_memories, timestamp, enriched_context, persona
+                )
+                if isinstance(batch_result, dict) and "consolidation" in batch_result:
+                    consolidated_results.extend(batch_result["consolidation"])
+                logger.debug(f"Consolidated batch of {len(batch_memories)} memories")
+
+                batch_memories = [memory]
+                current_batch_word_count = memory_word_count
+            else:
+                batch_memories.append(memory)
+                current_batch_word_count += memory_word_count
+
+        if batch_memories:
+            batch_result = await self._consolidate_async(
+                batch_memories, timestamp, enriched_context, persona
+            )
+            if isinstance(batch_result, dict) and "consolidation" in batch_result:
+                consolidated_results.extend(batch_result["consolidation"])
+            logger.debug(f"Consolidated final batch of {len(batch_memories)} memories")
+
+        logger.debug(
+            f"Consolidated {len(memories)} memories into {len(consolidated_results)} consolidated memories across multiple batches"
+        )
+        return {"consolidation": consolidated_results}
+
     @utils.llm(enable_json_output_format=True, enable_justification_step=False)
     def _consolidate(
+        self, memories: list, timestamp: str, context: str, persona: str
+    ) -> dict:
+        """
+        Given a list of input episodic memories, this method consolidates them into more organized structured representations, which however preserve all information and important details.
+
+        For this process, you assume:
+          - This consolidation is being carried out by an agent, so the memories are from the agent's perspective. "Actions" refer to behaviors produced by the agent,
+            while  "stimulus" refer to events or information from the environment or other agents that the agent has perceived.
+                * Thus, in the consoldation you write "I have done X" or "I have perceived Y", not "the agent has done X" or "the agent has perceived Y".
+          - The purpose of consolidation is to restructure and organize the most relevant information from the episodic memories, so that any facts learned therein can be used in future reasoning processes.
+                * If a `context` is provided, you can use it to guide the consolidation process, making sure that the memories are consolidated in the most useful way under the given context.
+                  For example, if the agent is looking for a specific type of information, you can focus the consolidation on that type of information, preserving more details about it
+                  than you would otherwise.
+                * If a `persona` is provided, you can use it to guide the consolidation process, making sure that the memories are consolidated in a way that is consistent with the persona.
+                  For example, if the persona is that of a cat lover, you can focus the consolidation on the agent's experiences with cats, preserving more details about them than you would otherwise.
+          - If the memory contians a `content` field, that's where the relevant information is found. Otherwise, consider the whole memory as relevant information.
+
+        The consolidation process follows these rules:
+          - Each consolidated memory groups together all similar entries: so actions are grouped together, stimuli go together, facts are grouped together, impressions are grouped together,
+            learned processes are grouped together, and ad-hoc elements go together too. Noise, minor details and irrelevant elements are discarded.
+            In all, you will produce at most the following consolidated entries (you can avoid some if appropriate, but not add more):
+              * Actions: all actions are grouped together, giving an account of what the agent has done.
+              * Stimuli: all stimuli are grouped together, giving an account of what the agent has perceived.
+              * Facts: facts are extracted from the actions and stimuli, and then grouped together in a single entry, consolidating learning of objective facts.
+              * Impressions: impressions, feelings, or other subjective experiences are also extracted,  and then grouped together in a single entry, consolidating subjective experiences.
+              * Procedural: learned processes (e.g., how to do certain things) are also extracted, formatted in an algorithmic way (i.e., pseudo-code that is self-explanatory), and then grouped together in a
+                single entry, consolidating learned processes.
+              * Ad-Hoc: important elements that do not correspond to these options are also grouped together in an ad-hoc single entry, consolidating other types of information.
+          - Each consolidated memory is a comprehensive report of the relevant information from the input memories, preserving all details. The consolidation merely reorganizes the information,
+            but does not remove any relevant information. The consolidated memories are not summaries, but rather a more organized and structured representation of the information in the input memories.
+
+
+        Each input memory is a dictionary of the form:
+            ```
+            {
+            "role": role,
+            "content": content,
+            "type": "action"/"stimulus"/"feedback"/"reflection",
+            "simulation_timestamp": timestamp
+            }
+            ```
+
+        Each consolidated output memory is a dictionary of the form:
+            ```
+            {
+            "content": content,
+            "type": "consolidated",
+            "simulation_timestamp": timestamp of the consolidation
+            }
+            ```
+
+
+         So the final value outputed **must** be a JSON composed of a list of dictionaries, each representing a consolidated memory, **always** with the following structure:
+            ```
+            {"consolidation":
+                [
+                    {
+                        "content": content_1,
+                        "type": "consolidated",
+                        "simulation_timestamp": timestamp of the consolidation
+                    },
+                    {
+                        "content": content_2,
+                        "type": "consolidated",
+                        "simulation_timestamp": timestamp of the consolidation
+                    },
+                    ...
+                ]
+            }
+            ```
+
+        Note:
+          - because the output is a JSON, you must use double quotes for the keys and string values.
+        ## Example (simplified)
+
+        Here's a simplified example. Suppose the following memory contents are provided as input (simplifying here as just a bullet list of contents):
+         - stimulus: "I have seen a cat, walking beautifully in the street"
+         - stimulus: "I have seen a dog, barking loudly at a passerby, looking very aggressive"
+         - action: "I have petted the cat, run around with him (or her?), saying a thousand times how cute it is, and how much I seem to like cats"
+         - action: "I just realized that I like cats more than dogs. For example, look at this one, it is so cute, so civilized, so noble, so elegant, an inspiring animal! I had never noted this before! "
+         - stimulus: "The cat is meowing very loudly, it seems to be hungry"
+         - stimulus: "Somehow a big capivara has appeared in the room, it is looking at me with curiosity"
+
+        Then, this would be a possible CORRECT output of the consolidation process (again, simplified, showing only contents in bullet list format):
+          - consolidated actions: "I have petted the cat, run around with it, and expressed my admiration for cats."
+          - consolidated stimuli: "I have seen a beautiful but hungry cat, a loud and agressive-looking dog, and - surprisingly - a capivara"
+          - consolidated impressions: "I felt great admiration for the cat, they look like such noble and elegant animals."
+          - consolidated facts: "I like cats more than dogs because they are cute and noble creatures."
+
+        These are correct because they focus on the agent's experience. In contrast, this would be an INCORRECT output of the consolidation process:
+          - consolidated actions: "the user sent messages about a cat, a dog and a capivara, and about playing with the cat."
+          - consolidated facts: "the assistant has received various messages at different times, and has performed actions in response to them."
+
+        These are incorrect because they focus on the agent's cognition and internal implementation mechanisms, not on the agent's experience.
+
+        Args:
+            memories (list): The list of memories to consolidate.
+            timestamp (str): The timestamp of the consolidation, which will be used in the consolidated memories instead of any original timestamp.
+            context (str, optional): Additional context to guide the consolidation process. This can be used to provide specific instructions or constraints for the consolidation.
+            persona (str, optional): The persona of the agent, which can be used to guide the consolidation process. This can be used to provide specific instructions or constraints for the consolidation.
+
+        Returns:
+            dict: A dictionary with a single key "consolidation", whose value is a list of consolidated memories, each represented as a dictionary with the structure described above.
+        """
+        # llm annotation will handle the implementation
+
+    @utils.llm_async(enable_json_output_format=True, enable_justification_step=False)
+    async def _consolidate_async(
         self, memories: list, timestamp: str, context: str, persona: str
     ) -> dict:
         """

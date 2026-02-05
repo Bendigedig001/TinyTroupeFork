@@ -10,6 +10,8 @@ from tinytroupe.agent import TinyPerson
 from tinytroupe.clients import client
 from tinytroupe.environment import TinyWorld
 from tinytroupe.extraction import logger
+from tinytroupe import config_manager
+import asyncio
 
 
 class ResultsExtractor:
@@ -49,6 +51,11 @@ class ResultsExtractor:
         # Cache for the last extraction results
         self.agent_extraction = {}
         self.world_extraction = {}
+
+    def _prompt_cache_params(self) -> dict:
+        template_name = os.path.basename(self._extraction_prompt_template_path)
+        family = f"extraction:results_extractor:{template_name}"
+        return utils.prompt_cache_params_for_family(family)
 
     def extract_results_from_agents(
         self,
@@ -157,7 +164,10 @@ performed.
         messages.append({"role": "user", "content": extraction_request_prompt})
 
         next_message = client().send_message(
-            messages, frequency_penalty=0.0, presence_penalty=0.0
+            messages,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            **self._prompt_cache_params(),
         )
 
         debug_msg = f"Extraction raw result message: {next_message}"
@@ -171,6 +181,89 @@ performed.
             result = None
 
         # cache the result
+        self.agent_extraction[tinyperson.name] = result
+
+        return result
+
+    async def extract_results_from_agent_async(
+        self,
+        tinyperson: TinyPerson,
+        extraction_objective: str = "The main points present in the agent's interactions history.",
+        situation: str = "",
+        fields: list = None,
+        fields_hints: dict = None,
+        verbose: bool = None,
+    ):
+        extraction_objective, situation, fields, fields_hints, verbose = (
+            self._get_default_values_if_necessary(
+                extraction_objective, situation, fields, fields_hints, verbose
+            )
+        )
+
+        messages = []
+
+        rendering_configs = {}
+        if fields is not None:
+            rendering_configs["fields"] = ", ".join(fields)
+
+        if fields_hints is not None:
+            rendering_configs["fields_hints"] = list(fields_hints.items())
+
+        messages.append(
+            {
+                "role": "system",
+                "content": chevron.render(
+                    open(
+                        self._extraction_prompt_template_path,
+                        "r",
+                        encoding="utf-8",
+                        errors="replace",
+                    ).read(),
+                    rendering_configs,
+                ),
+            }
+        )
+
+        # TODO: either summarize first or break up into multiple tasks
+        interaction_history = tinyperson.pretty_current_interactions(
+            max_content_length=None
+        )
+
+        extraction_request_prompt = f"""
+## Extraction objective
+
+{extraction_objective}
+
+## Situation
+You are considering a single agent, named {tinyperson.name}. Your objective thus refers to this agent specifically.
+{situation}
+
+## Agent Interactions History
+
+You will consider an agent's history of interactions, which include stimuli it received as well as actions it 
+performed.
+
+{interaction_history}
+"""
+        messages.append({"role": "user", "content": extraction_request_prompt})
+
+        next_message = await client().send_message_async(
+            messages,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            **self._prompt_cache_params(),
+        )
+
+        debug_msg = f"Extraction raw result message: {next_message}"
+        logger.debug(debug_msg)
+        if verbose:
+            print(debug_msg)
+
+        if next_message is not None:
+            result = utils.extract_json(next_message["content"])
+        else:
+            result = None
+
         self.agent_extraction[tinyperson.name] = result
 
         return result
@@ -249,7 +342,9 @@ Each interaction history includes stimuli the corresponding agent received as we
 """
         messages.append({"role": "user", "content": extraction_request_prompt})
 
-        next_message = client().send_message(messages, temperature=1.0)
+        next_message = client().send_message(
+            messages, temperature=1.0, **self._prompt_cache_params()
+        )
 
         debug_msg = f"Extraction raw result message: {next_message}"
         logger.debug(debug_msg)
@@ -265,6 +360,122 @@ Each interaction history includes stimuli the corresponding agent received as we
         self.world_extraction[tinyworld.name] = result
 
         return result
+
+    async def extract_results_from_world_async(
+        self,
+        tinyworld: TinyWorld,
+        extraction_objective: str = "The main points that can be derived from the agents conversations and actions.",
+        situation: str = "",
+        fields: list = None,
+        fields_hints: dict = None,
+        verbose: bool = None,
+    ):
+        extraction_objective, situation, fields, fields_hints, verbose = (
+            self._get_default_values_if_necessary(
+                extraction_objective, situation, fields, fields_hints, verbose
+            )
+        )
+
+        messages = []
+
+        rendering_configs = {}
+        if fields is not None:
+            rendering_configs["fields"] = ", ".join(fields)
+
+        if fields_hints is not None:
+            rendering_configs["fields_hints"] = list(fields_hints.items())
+
+        messages.append(
+            {
+                "role": "system",
+                "content": chevron.render(
+                    open(
+                        self._extraction_prompt_template_path,
+                        "r",
+                        encoding="utf-8",
+                        errors="replace",
+                    ).read(),
+                    rendering_configs,
+                ),
+            }
+        )
+
+        interaction_history = tinyworld.pretty_current_interactions(
+            max_content_length=None
+        )
+
+        extraction_request_prompt = f"""
+## Extraction objective
+
+{extraction_objective}
+
+## Situation
+You are considering various agents.
+{situation}
+
+## Agents Interactions History
+
+You will consider the history of interactions from various agents that exist in an environment called {tinyworld.name}. 
+Each interaction history includes stimuli the corresponding agent received as well as actions it performed.
+
+{interaction_history}
+"""
+        messages.append({"role": "user", "content": extraction_request_prompt})
+
+        next_message = await client().send_message_async(
+            messages,
+            temperature=1.0,
+            **self._prompt_cache_params(),
+        )
+
+        debug_msg = f"Extraction raw result message: {next_message}"
+        logger.debug(debug_msg)
+        if verbose:
+            print(debug_msg)
+
+        if next_message is not None:
+            result = utils.extract_json(next_message["content"])
+        else:
+            result = None
+
+        self.world_extraction[tinyworld.name] = result
+
+        return result
+
+    async def extract_results_from_agents_async(
+        self,
+        agents: List[TinyPerson],
+        extraction_objective: str = None,
+        situation: str = None,
+        fields: list = None,
+        fields_hints: dict = None,
+        verbose: bool = None,
+    ):
+        extraction_objective, situation, fields, fields_hints, verbose = (
+            self._get_default_values_if_necessary(
+                extraction_objective, situation, fields, fields_hints, verbose
+            )
+        )
+
+        max_workers = config_manager.get("max_concurrent_model_calls")
+        if max_workers is None:
+            max_workers = max(1, len(agents))
+        max_workers = max(1, min(len(agents), int(max_workers)))
+
+        semaphore = asyncio.Semaphore(max_workers)
+
+        async def _one(agent: TinyPerson):
+            async with semaphore:
+                return await self.extract_results_from_agent_async(
+                    agent,
+                    extraction_objective=extraction_objective,
+                    situation=situation,
+                    fields=fields,
+                    fields_hints=fields_hints,
+                    verbose=verbose,
+                )
+
+        return await asyncio.gather(*[_one(a) for a in agents])
 
     def save_as_json(self, filename: str, verbose: bool = False):
         """

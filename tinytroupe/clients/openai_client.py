@@ -1,4 +1,5 @@
 import configparser
+import json
 import logging
 import os
 import pickle
@@ -111,6 +112,7 @@ class OpenAIClient:
             self._input_tokens = 0
             self._output_tokens = 0
             self._total_tokens = 0
+            self._cached_prompt_tokens = 0
             self._model_calls = 0
             self._cached_calls = 0
 
@@ -197,6 +199,7 @@ class OpenAIClient:
         max_attempts="max_attempts",
         waiting_time="waiting_time",
         exponential_backoff_factor="exponential_backoff_factor",
+        prompt_cache_retention="prompt_cache_retention",
         response_format=None,
         echo=None,
     )
@@ -216,6 +219,8 @@ class OpenAIClient:
         waiting_time=None,
         exponential_backoff_factor=None,
         n=1,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
         response_format=None,
         enable_pydantic_model_return=False,
         echo=False,
@@ -273,7 +278,9 @@ class OpenAIClient:
         if dedent_messages:
             for message in current_messages:
                 if "content" in message:
-                    message["content"] = utils.dedent(message["content"])
+                    content = message["content"]
+                    if isinstance(content, str):
+                        message["content"] = utils.dedent(content)
 
         # We need to adapt the parameters to the API type, so we create a dictionary with them first
         chat_api_params = {
@@ -289,6 +296,12 @@ class OpenAIClient:
             "stream": False,
             "n": n,
         }
+
+        if config_manager.get("api_type") == "openai":
+            if prompt_cache_key is not None:
+                chat_api_params["prompt_cache_key"] = prompt_cache_key
+            if prompt_cache_retention is not None:
+                chat_api_params["prompt_cache_retention"] = prompt_cache_retention
 
         if response_format is not None:
             chat_api_params["response_format"] = response_format
@@ -422,6 +435,7 @@ class OpenAIClient:
         max_attempts="max_attempts",
         waiting_time="waiting_time",
         exponential_backoff_factor="exponential_backoff_factor",
+        prompt_cache_retention="prompt_cache_retention",
         response_format=None,
         echo=None,
     )
@@ -441,6 +455,8 @@ class OpenAIClient:
         waiting_time=None,
         exponential_backoff_factor=None,
         n=1,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
         response_format=None,
         enable_pydantic_model_return=False,
         echo=False,
@@ -475,7 +491,9 @@ class OpenAIClient:
         if dedent_messages:
             for message in current_messages:
                 if "content" in message:
-                    message["content"] = utils.dedent(message["content"])
+                    content = message["content"]
+                    if isinstance(content, str):
+                        message["content"] = utils.dedent(content)
 
         # We need to adapt the parameters to the API type, so we create a dictionary with them first
         chat_api_params = {
@@ -491,6 +509,12 @@ class OpenAIClient:
             "stream": False,
             "n": n,
         }
+
+        if config_manager.get("api_type") == "openai":
+            if prompt_cache_key is not None:
+                chat_api_params["prompt_cache_key"] = prompt_cache_key
+            if prompt_cache_retention is not None:
+                chat_api_params["prompt_cache_retention"] = prompt_cache_retention
 
         if response_format is not None:
             chat_api_params["response_format"] = response_format
@@ -868,7 +892,22 @@ class OpenAIClient:
             for message in messages:
                 num_tokens += tokens_per_message
                 for key, value in message.items():
-                    num_tokens += len(encoding.encode(value))
+                    if isinstance(value, list):
+                        for part in value:
+                            if not isinstance(part, dict):
+                                continue
+                            part_type = part.get("type")
+                            if part_type in {"text", "input_text"}:
+                                num_tokens += len(
+                                    encoding.encode(str(part.get("text", "")))
+                                )
+                            else:
+                                # image_url or other parts are not counted here
+                                continue
+                    elif isinstance(value, dict):
+                        num_tokens += len(encoding.encode(json.dumps(value)))
+                    else:
+                        num_tokens += len(encoding.encode(str(value)))
                     if key == "name":
                         num_tokens += tokens_per_name
             num_tokens += 3  # every reply is primed with <|start|>assistant<|message|>
@@ -952,6 +991,10 @@ class OpenAIClient:
                     self._output_tokens += usage.completion_tokens
                 if hasattr(usage, "total_tokens") and usage.total_tokens is not None:
                     self._total_tokens += usage.total_tokens
+                if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details is not None:
+                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", None)
+                    if cached_tokens is not None:
+                        self._cached_prompt_tokens += cached_tokens
 
                 # Log the latest values in debug mode
                 logger.debug(
@@ -978,6 +1021,7 @@ class OpenAIClient:
                 "input_tokens": self._input_tokens,
                 "output_tokens": self._output_tokens,
                 "total_tokens": self._total_tokens,
+                "cached_prompt_tokens": self._cached_prompt_tokens,
                 "model_calls": self._model_calls,
                 "cached_calls": self._cached_calls,
             }
@@ -993,6 +1037,7 @@ class OpenAIClient:
         print(f"Input tokens:         {stats['input_tokens']:,}")
         print(f"Output tokens:        {stats['output_tokens']:,}")
         print(f"Total tokens:         {stats['total_tokens']:,}")
+        print(f"Cached prompt tokens: {stats['cached_prompt_tokens']:,}")
         print(f"Model API calls:      {stats['model_calls']:,}")
         print(f"Cached calls:         {stats['cached_calls']:,}")
         print(f"Total calls:          {stats['model_calls'] + stats['cached_calls']:,}")

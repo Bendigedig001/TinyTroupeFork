@@ -132,7 +132,10 @@ class TinyPersonFactory(TinyFactory):
 
         messages.append({"role": "user", "content": user_prompt})
 
-        response = client().send_message(messages)
+        cache_params = utils.prompt_cache_params_for_family(
+            "factory:create_factories"
+        )
+        response = client().send_message(messages, **cache_params)
 
         if response is not None:
             result = utils.extract_json(response["content"])
@@ -2024,6 +2027,7 @@ class TinyPersonFactory(TinyFactory):
             messages,
             temperature=temperature,
             response_format={"type": "json_object"},
+            **utils.prompt_cache_params_for_family("factory:aux_model_call"),
         )
 
     async def _aux_model_call_async(self, messages, temperature):
@@ -2034,6 +2038,7 @@ class TinyPersonFactory(TinyFactory):
             messages,
             temperature=temperature,
             response_format={"type": "json_object"},
+            **utils.prompt_cache_params_for_family("factory:aux_model_call"),
         )
 
     @transactional()

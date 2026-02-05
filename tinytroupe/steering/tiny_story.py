@@ -80,7 +80,57 @@ class TinyStory:
             base_module_folder="steering",
             rendering_configs=rendering_configs,
         )
-        next_message = client().send_message(messages)
+        cache_params = utils.prompt_cache_params_for_family(
+            utils.prompt_cache_family_from_templates(
+                "story.start.system.mustache",
+                "story.start.user.mustache",
+                base_module_folder="steering",
+            )
+        )
+        next_message = client().send_message(messages, **cache_params)
+
+        start = next_message["content"]
+
+        self.current_story += utils.dedent(
+            f"""
+
+            ## The story begins
+
+            {start}
+
+            """
+        )
+
+        return start
+
+    async def start_story_async(
+        self,
+        requirements="Start some interesting story about the agents.",
+        number_of_words: int = 100,
+        include_plot_twist: bool = False,
+    ) -> str:
+        rendering_configs = {
+            "purpose": self.purpose,
+            "requirements": requirements,
+            "current_simulation_trace": self._current_story(),
+            "number_of_words": number_of_words,
+            "include_plot_twist": include_plot_twist,
+        }
+
+        messages = utils.compose_initial_LLM_messages_with_templates(
+            "story.start.system.mustache",
+            "story.start.user.mustache",
+            base_module_folder="steering",
+            rendering_configs=rendering_configs,
+        )
+        cache_params = utils.prompt_cache_params_for_family(
+            utils.prompt_cache_family_from_templates(
+                "story.start.system.mustache",
+                "story.start.user.mustache",
+                base_module_folder="steering",
+            )
+        )
+        next_message = await client().send_message_async(messages, **cache_params)
 
         start = next_message["content"]
 
@@ -120,7 +170,57 @@ class TinyStory:
             base_module_folder="steering",
             rendering_configs=rendering_configs,
         )
-        next_message = client().send_message(messages)
+        cache_params = utils.prompt_cache_params_for_family(
+            utils.prompt_cache_family_from_templates(
+                "story.continuation.system.mustache",
+                "story.continuation.user.mustache",
+                base_module_folder="steering",
+            )
+        )
+        next_message = client().send_message(messages, **cache_params)
+
+        continuation = next_message["content"]
+
+        self.current_story += utils.dedent(
+            f"""
+
+            ## The story continues
+
+            {continuation}
+
+            """
+        )
+
+        return continuation
+
+    async def continue_story_async(
+        self,
+        requirements="Continue the story in an interesting way.",
+        number_of_words: int = 100,
+        include_plot_twist: bool = False,
+    ) -> str:
+        rendering_configs = {
+            "purpose": self.purpose,
+            "requirements": requirements,
+            "current_simulation_trace": self._current_story(),
+            "number_of_words": number_of_words,
+            "include_plot_twist": include_plot_twist,
+        }
+
+        messages = utils.compose_initial_LLM_messages_with_templates(
+            "story.continuation.system.mustache",
+            "story.continuation.user.mustache",
+            base_module_folder="steering",
+            rendering_configs=rendering_configs,
+        )
+        cache_params = utils.prompt_cache_params_for_family(
+            utils.prompt_cache_family_from_templates(
+                "story.continuation.system.mustache",
+                "story.continuation.user.mustache",
+                base_module_folder="steering",
+            )
+        )
+        next_message = await client().send_message_async(messages, **cache_params)
 
         continuation = next_message["content"]
 

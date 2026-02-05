@@ -217,6 +217,7 @@ class Proposition:
                 enable_reasoning_step=True,
                 temperature=1.0,
                 model=model,
+                prompt_family="proposition:check",
             )
 
             self.value = self.llm_chat()
@@ -323,6 +324,7 @@ class Proposition:
                 enable_reasoning_step=True,
                 temperature=1.0,
                 model=model,
+                prompt_family="proposition:check",
             )
 
             self.value = await self.llm_chat.call_async()
@@ -470,6 +472,7 @@ class Proposition:
                 temperature=1.0,
                 # Use a reasoning model, which allows careful evaluation of the proposition.
                 model=model,
+                prompt_family="proposition:score",
             )
 
             self.value = self.llm_chat()
@@ -591,6 +594,7 @@ class Proposition:
                 enable_reasoning_step=True,
                 temperature=1.0,
                 model=model,
+                prompt_family="proposition:score",
             )
 
             self.value = await self.llm_chat.call_async()

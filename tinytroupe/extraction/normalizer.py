@@ -64,7 +64,12 @@ class Normalizer:
             output_type=dict,  # Request structured dict output
             enable_json_output_format=True,
             enable_justification_step=False,
-            enable_reasoning_step=False
+            enable_reasoning_step=False,
+            prompt_family=utils.prompt_cache_family_from_templates(
+                "normalizer.system.mustache",
+                "normalizer.user.mustache",
+                base_module_folder="extraction",
+            ),
         )
         
         result = chat.call(**rendering_configs)
@@ -219,7 +224,14 @@ class Normalizer:
                 rendering_configs=rendering_configs,
             )
 
-            next_message = client().send_message(messages)
+            cache_params = utils.prompt_cache_params_for_family(
+                utils.prompt_cache_family_from_templates(
+                    "normalizer.applier.system.mustache",
+                    "normalizer.applier.user.mustache",
+                    base_module_folder="extraction",
+                )
+            )
+            next_message = client().send_message(messages, **cache_params)
             if next_message is None or "content" not in next_message:
                 logger.error("LLM returned None or invalid response for normalization applier")
                 # Fallback: map elements to first available category

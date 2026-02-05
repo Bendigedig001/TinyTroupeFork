@@ -48,6 +48,7 @@ dependencies = [
     "pypandoc",
     "textdistance",
     "scipy",
+    "Pillow",
 ]
 
 [project.urls]

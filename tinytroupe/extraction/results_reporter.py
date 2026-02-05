@@ -84,6 +84,41 @@ class ResultsReporter:
         self.last_report = report
         return report
 
+    async def report_from_agents_async(
+        self,
+        agents: Union[TinyPerson, TinyWorld, List[TinyPerson]],
+        reporting_task: str = None,
+        report_title: str = "Simulation Report",
+        include_agent_summaries: bool = True,
+        consolidate_responses: bool = True,
+        requirements: str = "Present the findings in a clear, structured manner.",
+    ) -> str:
+        if reporting_task is None:
+            reporting_task = self.default_reporting_task
+
+        agent_list = self._extract_agents(agents)
+        if self.verbose:
+            logger.info(
+                f"Interviewing {len(agent_list)} agents for report generation (async)."
+            )
+
+        agent_responses = []
+        for agent in agent_list:
+            response = await self._interview_agent_async(agent, reporting_task)
+            agent_responses.append({"agent": agent, "response": response})
+
+        report = await self._format_agent_interview_report_async(
+            agent_responses,
+            report_title,
+            reporting_task,
+            include_agent_summaries,
+            consolidate_responses,
+            requirements,
+        )
+
+        self.last_report = report
+        return report
+
     def report_from_interactions(
         self,
         agents: Union[TinyPerson, TinyWorld, List[TinyPerson]],
@@ -134,6 +169,39 @@ class ResultsReporter:
         self.last_report = report
         return report
 
+    async def report_from_interactions_async(
+        self,
+        agents: Union[TinyPerson, TinyWorld, List[TinyPerson]],
+        report_title: str = "Interaction Analysis Report",
+        include_agent_summaries: bool = True,
+        first_n: int = None,
+        last_n: int = None,
+        max_content_length: int = None,
+        requirements: str = "Present the findings in a clear, structured manner.",
+    ) -> str:
+        agent_list = self._extract_agents(agents)
+        if self.verbose:
+            logger.info(
+                f"Analyzing interactions from {len(agent_list)} agents (async)."
+            )
+
+        interactions_data = []
+        for agent in agent_list:
+            interactions = agent.pretty_current_interactions(
+                simplified=True,
+                first_n=first_n,
+                last_n=last_n,
+                max_content_length=max_content_length,
+            )
+            interactions_data.append({"agent": agent, "interactions": interactions})
+
+        report = await self._format_interactions_report_async(
+            interactions_data, report_title, include_agent_summaries, requirements
+        )
+
+        self.last_report = report
+        return report
+
     def report_from_data(
         self,
         data: Union[str, Dict[str, Any], List[Dict[str, Any]]],
@@ -156,6 +224,22 @@ class ResultsReporter:
 
         # Generate the report
         report = self._format_data_report(data, report_title, requirements)
+
+        self.last_report = report
+        return report
+
+    async def report_from_data_async(
+        self,
+        data: Union[str, Dict[str, Any], List[Dict[str, Any]]],
+        report_title: str = "Data Report",
+        requirements: str = "Present the findings in a clear, structured manner.",
+    ) -> str:
+        if self.verbose:
+            logger.info("Generating report from raw data (async).")
+
+        report = await self._format_data_report_async(
+            data, report_title, requirements
+        )
 
         self.last_report = report
         return report
@@ -244,6 +328,36 @@ class ResultsReporter:
 
         return response.strip()
 
+    async def _interview_agent_async(self, agent: TinyPerson, reporting_task: str) -> str:
+        if self.verbose:
+            logger.debug(
+                f"Interviewing agent {agent.name} about: {reporting_task} (async)"
+            )
+
+        prompt = f"""
+        I need you to provide a comprehensive report based on your experiences and observations.
+        
+        Reporting task: {reporting_task}
+        
+        Please provide detailed insights, specific examples, and key findings from your perspective.
+        Focus on what you've learned, observed, and experienced during the simulation.
+        """
+
+        actions = await agent.listen_and_act_async(prompt, return_actions=True)
+
+        response = ""
+        for action in actions:
+            if (
+                isinstance(action, dict)
+                and action.get("action", {}).get("type") == "TALK"
+            ):
+                response += action.get("action", {}).get("content", "") + "\n"
+
+        if self.verbose:
+            logger.debug(f"Agent {agent.name} response received.")
+
+        return response.strip()
+
     def _format_agent_interview_report(
         self,
         agent_responses: List[Dict],
@@ -264,6 +378,34 @@ class ResultsReporter:
 
         # Generate report using LLM
         return self._generate_report_with_llm(
+            title=title,
+            report_type="agent_interview",
+            data={
+                "reporting_task": task,
+                "agents_data": agents_data,
+                "consolidate": consolidate,
+            },
+            include_summaries=include_summaries,
+            requirements=requirements,
+        )
+
+    async def _format_agent_interview_report_async(
+        self,
+        agent_responses: List[Dict],
+        title: str,
+        task: str,
+        include_summaries: bool,
+        consolidate: bool,
+        requirements: str,
+    ) -> str:
+        agents_data = []
+        for resp in agent_responses:
+            agent_info = {"name": resp["agent"].name, "response": resp["response"]}
+            if include_summaries:
+                agent_info["bio"] = resp["agent"].minibio(extended=False)
+            agents_data.append(agent_info)
+
+        return await self._generate_report_with_llm_async(
             title=title,
             report_type="agent_interview",
             data={
@@ -303,9 +445,41 @@ class ResultsReporter:
             requirements=requirements,
         )
 
+    async def _format_interactions_report_async(
+        self,
+        interactions_data: List[Dict],
+        title: str,
+        include_summaries: bool,
+        requirements: str,
+    ) -> str:
+        agents_data = []
+        for data in interactions_data:
+            agent_info = {
+                "name": data["agent"].name,
+                "interactions": data["interactions"],
+            }
+            if include_summaries:
+                agent_info["bio"] = data["agent"].minibio(extended=False)
+            agents_data.append(agent_info)
+
+        return await self._generate_report_with_llm_async(
+            title=title,
+            report_type="interactions",
+            data={"agents_data": agents_data},
+            include_summaries=include_summaries,
+            requirements=requirements,
+        )
+
     def _format_data_report(self, data: Any, title: str, requirements: str) -> str:
         """Format raw data into a Markdown report."""
         return self._generate_report_with_llm(
+            title=title, report_type="custom_data", data=data, requirements=requirements
+        )
+
+    async def _format_data_report_async(
+        self, data: Any, title: str, requirements: str
+    ) -> str:
+        return await self._generate_report_with_llm_async(
             title=title, report_type="custom_data", data=data, requirements=requirements
         )
 
@@ -427,9 +601,126 @@ class ResultsReporter:
             output_type=str,
             enable_json_output_format=False,
             model=config_manager.get("model"),
+            prompt_family=f"reporter:{report_type}",
         )
 
         return report_chat()
+
+    async def _generate_report_with_llm_async(
+        self,
+        title: str,
+        report_type: str,
+        data: Any,
+        include_summaries: bool = False,
+        requirements: str = None,
+    ) -> str:
+        system_prompt = "You are a professional report writer who creates clear, well-structured Markdown reports."
+
+        if report_type == "agent_interview":
+            system_prompt += " You specialize in synthesizing interview responses from multiple agents."
+            user_prompt = f"""
+            ## Task
+            Create a comprehensive report based on agent interviews such that it fulfills the 
+            specified requirements below.
+            
+            ## Report Title
+            {title}
+            
+            ## Report Details
+            - **Reporting Task:** {data['reporting_task']}
+            - **Number of Agents Interviewed:** {len(data['agents_data'])}
+            - **Generated on:** {self._get_timestamp()}
+            
+            ## Agent Responses
+            {json.dumps(data['agents_data'], indent=2)}
+            
+            ## Instructions
+            - Start with the title as a level-1 header
+            - Write a direct, clear report, but do not simplify or summarize the information
+            - Make sure all important details are included. This is not a summary, but a detailed report, so you never remove information, you just make it more readable
+            - Do not include the original data or agent responses, but only the resulting report information
+            - For each agent, include their bio if provided
+            - Use proper Markdown formatting throughout
+            - Follow the requirements given next, which can also override any of these rules
+            
+            ## Requirements
+            {requirements}
+            """
+
+        elif report_type == "interactions":
+            system_prompt += " You specialize in analyzing and presenting agent interaction histories."
+            user_prompt = f"""
+            ## Task
+            Create a report analyzing agent interactions from a simulation such that it fulfills the 
+            specified requirements below.
+            
+            ## Report Title
+            {title}
+            
+            ## Report Details
+            - **Number of Agents Analyzed:** {len(data['agents_data'])}
+            - **Generated on:** {self._get_timestamp()}
+            
+            ## Agent Interaction Data
+            {json.dumps(data['agents_data'], indent=2)}
+            
+            ## Instructions
+            - Start with the title as a level-1 header
+            - Write a direct, clear report, but do not simplify or summarize the information
+            - Make sure all important details are included. This is not a summary, but a detailed report, so you never remove information, you just make it more readable
+            - Do not include agents' interaction history, but only the resulting report information
+            - For each agent, include their bio if provided
+            - Use proper Markdown formatting throughout
+            - Follow the requirements given next, which can also override any of these rules
+            
+            ## Requirements
+            {requirements}
+            """
+
+        elif report_type == "custom_data":
+            if isinstance(data, str):
+                data_representation = data
+            else:
+                data_representation = json.dumps(data, indent=2)
+
+            user_prompt = f"""
+            ## Task
+            Create a well-structured Markdown report based on the provided data such that it fulfills the 
+            specified requirements below.
+            
+            ## Report Title
+            {title}
+            
+            ## Generated on
+            {self._get_timestamp()}
+            
+            ## Data to Format
+            {data_representation}
+            
+            ## Instructions
+            - Start with the title as a level-1 header
+            - Write a direct, clear report, but do not simplify or summarize the information
+            - Make sure all important details are included. This is not a summary, but a detailed report, so you never remove information, you just make it more readable
+            - Use proper Markdown formatting throughout
+            - Follow the requirements given next, which can also override any of these rules
+            
+            ## Requirements
+            {requirements if requirements else "Use your best judgment to create a clear, informative report that presents the data in an organized and readable manner."}
+            """
+
+        else:
+            raise ValueError(f"Unknown report type: {report_type}")
+
+        report_chat = LLMChat(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            output_type=str,
+            enable_json_output_format=False,
+            model=config_manager.get("model"),
+            prompt_family=f"reporter:{report_type}",
+        )
+
+        return await report_chat.call_async()
 
     def _get_timestamp(self) -> str:
         """Get current timestamp for report headers."""

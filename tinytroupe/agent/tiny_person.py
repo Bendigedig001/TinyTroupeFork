@@ -3,6 +3,7 @@ import json
 import os
 import textwrap  # to dedent strings
 import threading
+import asyncio
 from typing import Any
 
 import chevron  # to parse Mustache templates
@@ -19,6 +20,52 @@ from tinytroupe.utils import JsonSerializableRegistry, name_or_empty, repeat_on_
 
 # to protect from race conditions when running agents in parallel
 concurrent_agent_action_lock = threading.Lock()
+
+def _is_content_parts_list(content) -> bool:
+    if not isinstance(content, list) or not content:
+        return False
+    for part in content:
+        if not isinstance(part, dict) or "type" not in part:
+            return False
+    return True
+
+
+def _split_multimodal_parts(parts: list) -> tuple[list[str], list[dict]]:
+    text_chunks: list[str] = []
+    non_text_parts: list[dict] = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") in {"text", "input_text"}:
+            text_chunks.append(str(part.get("text", "")))
+        elif isinstance(part, dict):
+            non_text_parts.append(part)
+    return text_chunks, non_text_parts
+
+
+def _summarize_multimodal_text(text: str, parts: list[dict]) -> str:
+    image_count = 0
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}:
+            image_count += 1
+    summary = (text or "").strip()
+    if image_count:
+        suffix = f"[Attached images: {image_count}]"
+        summary = f"{summary}\n{suffix}" if summary else suffix
+    return summary or "[Multimodal content]"
+
+
+def _normalize_multimodal_content(content) -> tuple[str, list[dict]] | None:
+    if isinstance(content, dict) and isinstance(content.get("parts"), list):
+        parts = content.get("parts") or []
+        text_value = str(content.get("text") or "")
+        text_chunks, non_text_parts = _split_multimodal_parts(parts)
+        if not text_value and text_chunks:
+            text_value = "\n".join([t for t in text_chunks if t.strip()])
+        return text_value, non_text_parts
+    if _is_content_parts_list(content):
+        text_chunks, _ = _split_multimodal_parts(content)
+        text_value = "\n".join([t for t in text_chunks if t.strip()])
+        return text_value, content
+    return None
 
 
 #######################################################################################################################
@@ -147,6 +194,8 @@ class TinyPerson(JsonSerializableRegistry):
 
         if not hasattr(self, "_current_episode_event_count"):
             self._current_episode_event_count = 0  # the number of events in the current episode, used to limit the episode length
+        if not hasattr(self, "_pending_async_consolidation"):
+            self._pending_async_consolidation = False
 
         if not hasattr(self, "action_generator"):
             # This default value MUST NOT be in the method signature, otherwise it will be shared across all instances.
@@ -767,12 +816,45 @@ class TinyPerson(JsonSerializableRegistry):
 
             stimuli_payload = _latest_stimuli_payload()
             if stimuli_payload:
-                self.current_messages.append(
-                    {
-                        "role": "user",
-                        "content": stimuli_payload,  # dict will be JSON-serialized by the generator
-                    }
-                )
+                def _build_user_message_from_stimuli(payload: dict) -> dict:
+                    # Default: pass through JSON payload
+                    if not isinstance(payload, dict):
+                        return {"role": "user", "content": payload}
+
+                    supports_images = config_manager.get("api_type") in {"openai", "azure"}
+                    multimodal_parts: list[dict] = []
+                    simplified = copy.deepcopy(payload)
+
+                    for stim in simplified.get("stimuli", []) or []:
+                        content = stim.get("content")
+                        normalized = _normalize_multimodal_content(content)
+                        if normalized is None:
+                            continue
+                        text_value, parts = normalized
+                        stim["content"] = _summarize_multimodal_text(text_value, parts)
+                        if supports_images and parts:
+                            # For dict-based multimodal content we already extracted non-text parts.
+                            # For list-based content we keep all parts to preserve ordering.
+                            if isinstance(content, dict) and isinstance(content.get("parts"), list):
+                                multimodal_parts.extend(parts)
+                            else:
+                                multimodal_parts.extend(parts)
+
+                    if supports_images and multimodal_parts:
+                        return {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps(simplified, ensure_ascii=False),
+                                }
+                            ]
+                            + multimodal_parts,
+                        }
+
+                    return {"role": "user", "content": simplified}
+
+                self.current_messages.append(_build_user_message_from_stimuli(stimuli_payload))
 
             actions_or_action, role, content, all_negative_feedbacks = (
                 self.action_generator.generate_next_actions(self, self.current_messages)
@@ -1003,7 +1085,7 @@ class TinyPerson(JsonSerializableRegistry):
             aux_pre_act()
             await aux_act_once_sequence()
 
-        self.consolidate_episode_memories()
+        await self.consolidate_episode_memories_async()
 
         if return_actions:
             return contents
@@ -1420,7 +1502,11 @@ class TinyPerson(JsonSerializableRegistry):
             logger.warning(
                 f"[{self.name}] Episode length exceeded {self.MAX_EPISODE_LENGTH} events. Committing episode to memory. Please check whether this was expected or not."
             )
-            self.consolidate_episode_memories()
+            try:
+                asyncio.get_running_loop()
+                self._pending_async_consolidation = True
+            except RuntimeError:
+                self.consolidate_episode_memories()
 
     def consolidate_episode_memories(self) -> bool:
         """
@@ -1475,6 +1561,63 @@ class TinyPerson(JsonSerializableRegistry):
             )
 
             # TODO reflections, optimizations, etc.
+
+    async def consolidate_episode_memories_async(self) -> bool:
+        """
+        Async variant of `consolidate_episode_memories()`.
+        """
+        if (
+            self._current_episode_event_count > self.MIN_EPISODE_LENGTH
+            or self._pending_async_consolidation
+        ):
+            logger.debug(
+                f"[{self.name}] ***** Consolidating current episode memories into semantic memory (async) *****"
+            )
+
+            if config_manager.get("enable_memory_consolidation"):
+                episodic_consolidator = EpisodicConsolidator()
+                episode = self.episodic_memory.get_current_episode(
+                    item_types=["action", "stimulus"],
+                )
+                logger.debug(f"[{self.name}] Current episode: {episode}")
+                consolidated_memories = await episodic_consolidator.process_async(
+                    episode,
+                    timestamp=self._mental_state["datetime"],
+                    context=self._mental_state,
+                    persona=self.minibio(),
+                )
+                consolidated_memories = (
+                    consolidated_memories.get("consolidation", None)
+                    if isinstance(consolidated_memories, dict)
+                    else None
+                )
+                if consolidated_memories is not None:
+                    logger.info(
+                        f"[{self.name}] Consolidating current {len(episode)} episodic events as consolidated semantic memories."
+                    )
+                    logger.debug(
+                        f"[{self.name}] Consolidated memories: {consolidated_memories}"
+                    )
+                    self.semantic_memory.store_all(consolidated_memories)
+                else:
+                    logger.warning(
+                        f"[{self.name}] No memories to consolidate from the current episode."
+                    )
+
+            else:
+                logger.warning(
+                    f"[{self.name}] Memory consolidation is disabled. Not consolidating current episode memories into semantic memory."
+                )
+
+            self.episodic_memory.commit_episode()
+            self._current_episode_event_count = 0
+            self._pending_async_consolidation = False
+            logger.debug(
+                f"[{self.name}] Current episode event count reset to 0 after consolidation."
+            )
+            return True
+
+        return False
 
     def optimize_memory(self):
         pass  # TODO
@@ -1788,6 +1931,7 @@ class TinyPerson(JsonSerializableRegistry):
 
                                                 **Detailed specification:** {self._persona}
                                                 """,
+                prompt_family="tinyperson:extended_summary",
             ).call()
 
         if extended:
