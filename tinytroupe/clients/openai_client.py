@@ -4,13 +4,14 @@ import os
 import pickle
 import threading
 import time
-from contextlib import contextmanager
+import asyncio
+from contextlib import asynccontextmanager, contextmanager
 from typing import Union
 
 import httpx
 import openai
 import tiktoken
-from openai import APITimeoutError, AzureOpenAI, OpenAI
+from openai import APITimeoutError, AsyncOpenAI, AzureOpenAI, OpenAI
 
 from tinytroupe import config_manager, utils
 from tinytroupe.control import transactional
@@ -51,10 +52,21 @@ class OpenAIClient:
             if self._max_concurrent_model_calls is not None
             else None
         )
+        self._async_concurrency_semaphore = (
+            asyncio.BoundedSemaphore(self._max_concurrent_model_calls)
+            if self._max_concurrent_model_calls is not None
+            else None
+        )
 
         # Initialize cost tracking variables
         self._cost_stats_lock = threading.RLock()
         self._reset_cost_stats()
+
+        # Async client resources (lazily initialized)
+        self._async_client_lock = asyncio.Lock()
+        self._async_http_client: httpx.AsyncClient | None = None
+        self._async_client: AsyncOpenAI | None = None
+        self._async_client_timeout: float | None = None
 
         self.set_api_cache(cache_api_calls, cache_file_name)
 
@@ -128,6 +140,52 @@ class OpenAIClient:
         self.client = OpenAI(
             api_key=os.getenv("OPENAI_API_KEY"), max_retries=0, http_client=httpx_client
         )
+
+    @config_manager.config_defaults(timeout="timeout")
+    async def _setup_async_from_config(self, timeout=None):
+        """
+        Sets up the async OpenAI API configurations for this client.
+        """
+        async with self._async_client_lock:
+            # If already configured for this timeout, keep it.
+            if self._async_client is not None and self._async_client_timeout == timeout:
+                return
+
+            # Close any previous async httpx client to avoid connection leaks.
+            if self._async_http_client is not None:
+                try:
+                    await self._async_http_client.aclose()
+                except Exception:
+                    pass
+
+            httpx_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    timeout=timeout,  # Overall timeout
+                    connect=10.0,  # Connection timeout (fixed at 10s)
+                    read=timeout,  # Read timeout (from config)
+                    write=10.0,  # Write timeout (fixed at 10s)
+                    pool=5.0,  # Pool timeout (fixed at 5s)
+                )
+            )
+
+            self._async_http_client = httpx_client
+            self._async_client_timeout = timeout
+            self._async_client = AsyncOpenAI(
+                api_key=os.getenv("OPENAI_API_KEY"), max_retries=0, http_client=httpx_client
+            )
+
+    async def aclose(self) -> None:
+        """
+        Closes any underlying async HTTP client resources held by this instance.
+        """
+        async with self._async_client_lock:
+            if self._async_http_client is not None:
+                try:
+                    await self._async_http_client.aclose()
+                finally:
+                    self._async_http_client = None
+                    self._async_client = None
+                    self._async_client_timeout = None
 
     @config_manager.config_defaults(
         model="model",
@@ -354,6 +412,201 @@ class OpenAIClient:
         logger.error(f"Failed to get response after {max_attempts} attempts.")
         return None
 
+    @config_manager.config_defaults(
+        model="model",
+        temperature="temperature",
+        max_completion_tokens="max_completion_tokens",
+        frequency_penalty="frequency_penalty",
+        presence_penalty="presence_penalty",
+        timeout="timeout",
+        max_attempts="max_attempts",
+        waiting_time="waiting_time",
+        exponential_backoff_factor="exponential_backoff_factor",
+        response_format=None,
+        echo=None,
+    )
+    async def send_message_async(
+        self,
+        current_messages,
+        dedent_messages=True,
+        model=None,
+        temperature=None,
+        max_completion_tokens=None,
+        top_p=None,
+        frequency_penalty=None,
+        presence_penalty=None,
+        stop=None,
+        timeout=None,
+        max_attempts=None,
+        waiting_time=None,
+        exponential_backoff_factor=None,
+        n=1,
+        response_format=None,
+        enable_pydantic_model_return=False,
+        echo=False,
+    ):
+        """
+        Async variant of `send_message`, backed by `openai.AsyncOpenAI`.
+        """
+        from tinytroupe.clients import (  # avoid circular import
+            InvalidRequestError,
+            NonTerminalError,
+        )
+
+        async def aux_exponential_backoff():
+            nonlocal waiting_time
+
+            # in case waiting time was initially set to 0
+            if waiting_time <= 0:
+                waiting_time = 2
+
+            logger.info(
+                f"Request failed. Waiting {waiting_time} seconds between requests..."
+            )
+            await asyncio.sleep(waiting_time)
+
+            # exponential backoff
+            waiting_time = waiting_time * exponential_backoff_factor
+
+        # setup the OpenAI configurations for this client.
+        await self._setup_async_from_config(timeout=timeout)
+
+        # dedent the messages (field 'content' only) if needed (using textwrap)
+        if dedent_messages:
+            for message in current_messages:
+                if "content" in message:
+                    message["content"] = utils.dedent(message["content"])
+
+        # We need to adapt the parameters to the API type, so we create a dictionary with them first
+        chat_api_params = {
+            "model": model,
+            "messages": current_messages,
+            "temperature": temperature,
+            "max_completion_tokens": max_completion_tokens,
+            "top_p": top_p,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "stop": stop,
+            "timeout": timeout,
+            "stream": False,
+            "n": n,
+        }
+
+        if response_format is not None:
+            chat_api_params["response_format"] = response_format
+
+        # remove any parameter that is None, so we use the API defaults
+        chat_api_params = {k: v for k, v in chat_api_params.items() if v is not None}
+
+        i = 0
+        while i < max_attempts:
+            try:
+                i += 1
+
+                try:
+                    logger.debug(
+                        f"Sending messages to OpenAI API. Token count={self._count_tokens(current_messages, model)}."
+                    )
+                except NotImplementedError:
+                    logger.debug(f"Token count not implemented for model {model}.")
+
+                start_time = time.monotonic()
+                logger.debug(
+                    f"Calling model with client class {self.__class__.__name__} (async)."
+                )
+
+                ###############################################################
+                # call the model, either from the cache or from the API
+                ###############################################################
+                cache_key = str((model, chat_api_params))  # need string to be hashable
+
+                pre_cached_response = self._get_cached_response(cache_key)
+
+                should_wait_before_call = (
+                    waiting_time > 0 and pre_cached_response is None
+                )
+
+                if should_wait_before_call:
+                    logger.info(
+                        f"Waiting {waiting_time} seconds before next API request (to avoid throttling)..."
+                    )
+                    await asyncio.sleep(waiting_time)
+
+                async with self._async_concurrency_slot():
+                    response = None
+                    cached_response = (
+                        pre_cached_response
+                        if pre_cached_response is not None
+                        else self._get_cached_response(cache_key)
+                    )
+
+                    if cached_response is not None:
+                        response = cached_response
+                    else:
+                        response = await self._raw_model_call_async(model, chat_api_params)
+                        if self.cache_api_calls:
+                            with self._cache_lock:
+                                existing = (
+                                    self.api_cache.get(cache_key)
+                                    if hasattr(self, "api_cache")
+                                    else None
+                                )
+                                if existing is None:
+                                    cacheable_response = self._to_cacheable_format(response)
+                                    if cacheable_response is not None:
+                                        self.api_cache[cache_key] = cacheable_response
+                                        self._save_cache()
+                                else:
+                                    response = existing
+
+                    raw_message = self._raw_model_response_extractor(response)
+
+                    # Update cost statistics
+                    self._update_cost_stats(response, cached_response is not None)
+
+                logger.debug(f"Got response from API: {response}")
+                end_time = time.monotonic()
+                logger.debug(
+                    f"Got response in {end_time - start_time:.2f} seconds after {i} attempts."
+                )
+
+                if enable_pydantic_model_return:
+                    return utils.to_pydantic_or_sanitized_dict(
+                        raw_message,
+                        model=response_format,
+                    )
+                else:
+                    return utils.sanitize_dict(raw_message)
+
+            except InvalidRequestError as e:
+                logger.error(f"[{i}] Invalid request error, won't retry: {e}")
+                return None
+
+            except openai.BadRequestError as e:
+                logger.error(f"[{i}] Invalid request error, won't retry: {e}")
+                return None
+
+            except openai.RateLimitError:
+                logger.warning(
+                    f"[{i}] Rate limit error, waiting a bit and trying again."
+                )
+                await aux_exponential_backoff()
+
+            except NonTerminalError as e:
+                logger.error(f"[{i}] Non-terminal error: {e}")
+                await aux_exponential_backoff()
+
+            except APITimeoutError as e:
+                logger.error(f"[{i}] API Timeout error: {e}")
+                # no exponential timeout backoff here, just retry
+
+            except Exception as e:
+                logger.error(f"[{i}] {type(e).__name__} Error: {e}")
+                await aux_exponential_backoff()
+
+        logger.error(f"Failed to get response after {max_attempts} attempts.")
+        return None
+
     def _raw_model_call(self, model, chat_api_params):
         """
         Calls the OpenAI API with the given parameters. Subclasses should
@@ -409,6 +662,62 @@ class OpenAIClient:
                 f"Calling LLM model with these parameters: {logged_params}. Not showing 'messages' parameter."
             )
             return self.client.chat.completions.create(**chat_api_params)
+
+    async def _raw_model_call_async(self, model, chat_api_params):
+        """
+        Async version of `_raw_model_call`.
+        """
+        if self._async_client is None:
+            # Defensive: ensure setup happened
+            await self._setup_async_from_config()
+
+        # adjust parameters depending on the model
+        if self._is_reasoning_model(model):
+            # Reasoning models have slightly different parameters
+            if "stream" in chat_api_params:
+                del chat_api_params["stream"]
+            if "temperature" in chat_api_params:
+                del chat_api_params["temperature"]
+            if "top_p" in chat_api_params:
+                del chat_api_params["top_p"]
+            if "frequency_penalty" in chat_api_params:
+                del chat_api_params["frequency_penalty"]
+            if "presence_penalty" in chat_api_params:
+                del chat_api_params["presence_penalty"]
+
+            if "max_completion_tokens" in chat_api_params:
+                chat_api_params["max_completion_tokens"] = chat_api_params["max_completion_tokens"]
+                del chat_api_params["max_completion_tokens"]
+
+            chat_api_params["reasoning_effort"] = config_manager.get("reasoning_effort")
+
+        # gpt-5 only supports temperature=1.0 (default), so remove temperature param if not default
+        if "gpt-5" in model and "temperature" in chat_api_params:
+            if chat_api_params["temperature"] != 1.0:
+                logger.warning(
+                    f"gpt-5 only supports temperature=1.0, removing custom temperature={chat_api_params['temperature']}"
+                )
+                del chat_api_params["temperature"]
+
+        # To make the log cleaner, we remove the messages from the logged parameters
+        logged_params = {k: v for k, v in chat_api_params.items() if k != "messages"}
+
+        if "response_format" in chat_api_params:
+            if "stream" in chat_api_params:
+                del chat_api_params["stream"]
+
+            logger.debug(
+                f"Calling LLM model (using .parse too) with these parameters: {logged_params}. Not showing 'messages' parameter."
+            )
+            logger.debug(
+                f"   --> Complete messages sent to LLM: {chat_api_params['messages']}"
+            )
+            return await self._async_client.beta.chat.completions.parse(**chat_api_params)
+
+        logger.debug(
+            f"Calling LLM model with these parameters: {logged_params}. Not showing 'messages' parameter."
+        )
+        return await self._async_client.chat.completions.create(**chat_api_params)
 
     def _is_reasoning_model(self, model):
         return "o1" in model or "o3" in model
@@ -483,6 +792,18 @@ class OpenAIClient:
             yield
         finally:
             self._concurrency_semaphore.release()
+
+    @asynccontextmanager
+    async def _async_concurrency_slot(self):
+        if self._async_concurrency_semaphore is None:
+            yield
+            return
+
+        await self._async_concurrency_semaphore.acquire()
+        try:
+            yield
+        finally:
+            self._async_concurrency_semaphore.release()
 
     def _count_tokens(self, messages: list, model: str):
         """

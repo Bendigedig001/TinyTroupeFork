@@ -2,7 +2,9 @@ import logging
 import os
 import pickle
 import time
+import asyncio
 
+import httpx
 import requests
 
 from tinytroupe import config_manager, utils
@@ -165,6 +167,128 @@ class OllamaClient:
             except Exception as e:
                 logger.error(f"[{i}] Error: {e}")
                 aux_exponential_backoff()
+
+        logger.error(f"Failed to get response after {max_attempts} attempts")
+        return None
+
+    @config_manager.config_defaults(
+        model="model",
+        temperature="temperature",
+        top_p="top_p",
+        frequency_penalty="frequency_penalty",
+        presence_penalty="presence_penalty",
+        num_ctx="num_ctx",
+        timeout="timeout",
+        max_attempts="max_attempts",
+        waiting_time="waiting_time",
+        exponential_backoff_factor="exponential_backoff_factor",
+        response_format=None,
+        echo=None,
+    )
+    async def send_message_async(
+        self,
+        current_messages,
+        dedent_messages=True,
+        model=None,
+        temperature=None,
+        max_completion_tokens=None,  # Ollama doesn't use max_completion_tokens
+        top_p=None,
+        frequency_penalty=None,
+        presence_penalty=None,
+        stop=None,
+        num_ctx=None,
+        timeout=None,
+        max_attempts=None,
+        waiting_time=None,
+        exponential_backoff_factor=None,
+        n=1,
+        response_format=None,
+        enable_pydantic_model_return=False,
+        echo=False,
+    ):
+        """
+        Async variant of `send_message` using `httpx.AsyncClient`.
+        """
+        from tinytroupe.clients import (  # avoid circular import
+            InvalidRequestError,
+            NonTerminalError,
+        )
+
+        async def aux_exponential_backoff():
+            nonlocal waiting_time
+            logger.info(
+                f"Request failed. Waiting {waiting_time} seconds between requests..."
+            )
+            await asyncio.sleep(waiting_time)
+            waiting_time = waiting_time * exponential_backoff_factor
+
+        chat_api_params = {
+            "model": model,
+            "messages": current_messages,
+            "options": {
+                "temperature": temperature,
+                "top_p": top_p,
+                "frequency_penalty": frequency_penalty,
+                "presence_penalty": presence_penalty,
+                "stop": stop,
+                "num_ctx": num_ctx,
+            },
+            "stream": False,
+            "n": n,
+        }
+
+        chat_api_params = {k: v for k, v in chat_api_params.items() if v is not None}
+        chat_api_params["options"] = {
+            k: v for k, v in chat_api_params["options"].items() if v is not None
+        }
+
+        i = 0
+        while i < max_attempts:
+            try:
+                i += 1
+
+                start_time = time.monotonic()
+                logger.debug(f"Sending request to Ollama API (async). Attempt {i}")
+
+                cache_key = str((model, chat_api_params))
+                if self.cache_api_calls and (cache_key in self.api_cache):
+                    response = self.api_cache[cache_key]
+                else:
+                    logger.info(
+                        f"Waiting {waiting_time} seconds before next API request..."
+                    )
+                    await asyncio.sleep(waiting_time)
+
+                    url = f"{self.base_url}/chat/completions"
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        resp = await client.post(url, json=chat_api_params)
+                        resp.raise_for_status()
+                        response = resp.json()
+
+                    if self.cache_api_calls:
+                        self.api_cache[cache_key] = response
+                        self._save_cache()
+
+                end_time = time.monotonic()
+                logger.debug(
+                    f"Got response in {end_time - start_time:.2f} seconds after {i} attempts"
+                )
+
+                return utils.sanitize_dict(self._extract_response(response))
+
+            except httpx.HTTPStatusError as e:
+                logger.error(f"[{i}] Request error: {e}")
+                if e.response is not None and e.response.status_code == 400:
+                    raise InvalidRequestError(str(e))
+                await aux_exponential_backoff()
+
+            except httpx.RequestError as e:
+                logger.error(f"[{i}] Request error: {e}")
+                await aux_exponential_backoff()
+
+            except Exception as e:
+                logger.error(f"[{i}] Error: {e}")
+                await aux_exponential_backoff()
 
         logger.error(f"Failed to get response after {max_attempts} attempts")
         return None

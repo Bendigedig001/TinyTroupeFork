@@ -1,11 +1,12 @@
 import concurrent.futures
+import asyncio
 import copy
 import json
 import math
 import os
 import random
 import threading
-from typing import Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import chevron
 
@@ -62,6 +63,34 @@ class TinyPersonFactory(TinyFactory):
             []
         )  # keep track of the generated persons. We keep the minibio to avoid generating the same person twice.
         self.generated_names = []
+
+        # Async-only (non-serializable) fields
+        self._init_async_state()
+
+    def _init_async_state(self) -> None:
+        # These fields must not be included in transactional state snapshots.
+        self._async_generation_lock = asyncio.Lock()
+        self._async_sampling_init_lock = asyncio.Lock()
+
+    def encode_complete_state(self) -> dict:
+        """
+        Override to exclude non-serializable async fields from transactional snapshots.
+        """
+        state: dict[str, Any] = {}
+        for k, v in self.__dict__.items():
+            if isinstance(k, str) and k.startswith("_async_"):
+                continue
+            state[k] = copy.deepcopy(v)
+        return state
+
+    def decode_complete_state(self, state: dict):
+        """
+        Restore serialized state and recreate async-only fields.
+        """
+        state = copy.deepcopy(state)
+        self.__dict__.update(state)
+        self._init_async_state()
+        return self
 
     # TODO obsolete?
     @staticmethod
@@ -418,6 +447,492 @@ class TinyPersonFactory(TinyFactory):
                 )
 
             return None
+
+    async def _llm_execute_async(
+        self,
+        *,
+        docstring: str,
+        return_type: Any,
+        args: Optional[list] = None,
+        kwargs: Optional[dict] = None,
+        enable_json_output_format: bool = True,
+        enable_justification_step: bool = True,
+        enable_reasoning_step: bool = False,
+        **model_overrides,
+    ):
+        """
+        Executes a docstring-defined computation using the LLM, mirroring the `@utils.llm` parameter
+        serialization style, but asynchronously.
+        """
+        args = [] if args is None else list(args)
+        kwargs = {} if kwargs is None else dict(kwargs)
+
+        system_prompt = "You are an AI system that executes a computation as defined below.\n\n"
+        system_prompt += (docstring or "").strip()
+
+        user_prompt = (
+            "Execute the above computation as best as you can using the following input parameter values and respecting the output format defined by the computation specification. Produce the requested output even if it is very long.\n"
+        )
+        user_prompt += f" ## Unnamed parameters\n{json.dumps(args, indent=4)}\n\n"
+        user_prompt += f" ## Named parameters\n{json.dumps(kwargs, indent=4)}\n\n"
+        user_prompt += (
+            " ## Output format\n"
+            "The output must be of type and format defined in the computation specification above.\n"
+            "Do not confirm anything with the user, as this is an automated request, just produce the requested output type directly as best as you can.\n"
+        )
+
+        llm_req = utils.LLMChat(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            output_type=return_type,
+            enable_json_output_format=enable_json_output_format,
+            enable_justification_step=enable_justification_step,
+            enable_reasoning_step=enable_reasoning_step,
+            **model_overrides,
+        )
+        return await llm_req.call_async()
+
+    async def _aux_unique_full_name_async(
+        self, already_generated_names: list, context: str = None
+    ) -> str:
+        doc = getattr(self._aux_unique_full_name, "__doc__", "") or ""
+        return await self._llm_execute_async(
+            docstring=doc,
+            return_type=str,
+            args=[],
+            kwargs={
+                "already_generated_names": already_generated_names,
+                "context": context,
+            },
+        )
+
+    async def _compute_sampling_dimensions_async(self, sampling_space_description: str) -> dict:
+        doc = getattr(self._compute_sampling_dimensions, "__doc__", "") or ""
+        return await self._llm_execute_async(
+            docstring=doc,
+            return_type=dict,
+            args=[],
+            kwargs={"sampling_space_description": sampling_space_description},
+            enable_json_output_format=True,
+            enable_justification_step=False,
+            enable_reasoning_step=False,
+        )
+
+    async def _compute_sample_plan_async(
+        self,
+        N: int,
+        sampling_dimensions: dict,
+        max_quantity_per_sample_directive: int = 5,
+        min_sampling_directives: int = 10,
+        max_sampling_directives: int = 50,
+        enforce_usage_of_all_dimensions: bool = True,
+        context: str = None,
+    ) -> dict:
+        doc = getattr(self._compute_sample_plan, "__doc__", "") or ""
+        return await self._llm_execute_async(
+            docstring=doc,
+            return_type=dict,
+            args=[],
+            kwargs={
+                "N": N,
+                "sampling_dimensions": sampling_dimensions,
+                "max_quantity_per_sample_directive": max_quantity_per_sample_directive,
+                "min_sampling_directives": min_sampling_directives,
+                "max_sampling_directives": max_sampling_directives,
+                "enforce_usage_of_all_dimensions": enforce_usage_of_all_dimensions,
+                "context": context,
+            },
+            enable_json_output_format=True,
+            enable_justification_step=False,
+            enable_reasoning_step=False,
+        )
+
+    async def _generate_name_for_sample_async(
+        self, sample_characteristics: dict, already_generated_names: list
+    ) -> str:
+        doc = getattr(self._generate_name_for_sample, "__doc__", "") or ""
+        return await self._llm_execute_async(
+            docstring=doc,
+            return_type=str,
+            args=[],
+            kwargs={
+                "sample_characteristics": sample_characteristics,
+                "already_generated_names": already_generated_names,
+            },
+            enable_json_output_format=False,
+        )
+
+    async def initialize_sampling_plan_async(self) -> None:
+        """
+        Async variant of `initialize_sampling_plan()`.
+        """
+        async with self._async_sampling_init_lock:
+            if self.remaining_characteristics_sample is not None:
+                return
+
+            n = self.population_size
+            description = self.sampling_space_description
+            context = self.context_text
+
+            async def _retry(coro_factory, postcond=None, retries=15):
+                last_exc = None
+                for _ in range(retries):
+                    try:
+                        result = await coro_factory()
+                        if postcond is None or postcond(result):
+                            return result
+                    except Exception as e:
+                        last_exc = e
+                if last_exc is not None:
+                    raise last_exc
+                raise RuntimeError("Async retry failed without exception.")
+
+            sampling_dimensions = await _retry(
+                lambda: self._compute_sampling_dimensions_async(
+                    sampling_space_description=description
+                ),
+                postcond=lambda result: isinstance(result, dict),
+                retries=15,
+            )
+            logger.info("Sampling dimensions computed successfully (async).")
+
+            sampling_plan_result = await _retry(
+                lambda: self._compute_sample_plan_async(
+                    N=n,
+                    sampling_dimensions=sampling_dimensions,
+                    enforce_usage_of_all_dimensions=self.enforce_usage_of_all_dimensions,
+                ),
+                postcond=lambda result: isinstance(result, dict)
+                and isinstance(result.get("sample_plan"), list)
+                and len(result.get("sample_plan")) > 0,
+                retries=15,
+            )
+
+            sampling_plan = sampling_plan_result["sample_plan"]
+            if isinstance(sampling_plan, dict):
+                sampling_plan = [sampling_plan]
+                logger.warning(
+                    "The sampling plan was a dictionary, enclosing it in a list to ensure it is processed correctly."
+                )
+
+            remaining_characteristics_sample = copy.deepcopy(
+                self._flatten_sampling_plan(sampling_plan=sampling_plan)
+            )
+
+            if len(remaining_characteristics_sample) != n:
+                logger.warning(
+                    f"Expected {n} samples, but got {len(remaining_characteristics_sample)} samples. The LLM may have failed to sum up the quantities in the sampling plan correctly."
+                )
+
+            all_used_names = TinyPersonFactory._all_used_and_precomputed_names()
+
+            for i, sample in enumerate(remaining_characteristics_sample):
+                logger.debug(
+                    f"Generating name for sample {i+1}/{len(remaining_characteristics_sample)} (async)"
+                )
+                TinyFactory.randomizer.shuffle(all_used_names)
+                try:
+                    name = await self._generate_name_for_sample_async(
+                        sample_characteristics=sample,
+                        already_generated_names=all_used_names,
+                    )
+                    if isinstance(name, str):
+                        name = name.strip()
+                    if not name:
+                        raise ValueError("Empty name returned.")
+                    sample["name"] = name
+                    all_used_names.append(name)
+                except Exception as e:
+                    logger.error(f"Error generating name for sample {i}: {e}")
+                    fallback_name = f"Person_{i}_{sample.get('gender', 'unknown')}"
+                    sample["name"] = fallback_name
+                    all_used_names.append(fallback_name)
+
+            new_names = [sample["name"] for sample in remaining_characteristics_sample]
+            TinyPersonFactory.all_unique_names = list(
+                set(TinyPersonFactory.all_unique_names + new_names)
+            )
+
+            self.sampling_dimensions = sampling_dimensions
+            self.sampling_plan = sampling_plan
+            self.remaining_characteristics_sample = remaining_characteristics_sample
+
+    async def generate_person_async(
+        self,
+        agent_particularities: str = None,
+        temperature: float = 1.0,
+        attempts: int = 10,
+        post_processing_func=None,
+    ) -> TinyPerson:
+        """
+        Async variant of `generate_person()`.
+        """
+
+        logger.debug(
+            f"Starting the async person generation based these particularities: {agent_particularities}"
+        )
+        sampled_characteristics = None
+        fresh_agent_name = None
+
+        if self.population_size is not None:
+            await self.initialize_sampling_plan_async()
+
+            async with self._async_generation_lock:
+                if self.remaining_characteristics_sample is None:
+                    raise RuntimeError("Sampling plan not initialized.")
+                if len(self.remaining_characteristics_sample) == 0:
+                    logger.warning(
+                        "No more characteristics samples left to sample from. This can happen if the sampling plan did not sum up correctly."
+                    )
+                    return None
+                sampled_characteristics = self.remaining_characteristics_sample.pop()
+
+            if agent_particularities is not None:
+                agent_particularities = f"""
+                        - Primary characteristics: {agent_particularities}
+
+                        - Also use all the following additional characteristics that **do not** conflict with the primary ones:
+                            * Name, demographics and other characteristics: {json.dumps(sampled_characteristics, indent=4)}
+
+                        In case one of the additional characteristics conflicts with a primary one, please use the primary one
+                        and ignore the additional one.
+
+                        If the agent's name is specified, you MUST ALWAYS use it, even if it conflicts with the primary characteristics.
+
+                    """
+            else:
+                agent_particularities = f"""
+                    - Name, demographics and other characteristics:
+                         {json.dumps(sampled_characteristics, indent=4)}
+                    """
+        else:
+            # Generate a fresh name without holding locks across awaits.
+            already = TinyPersonFactory._all_used_and_precomputed_names()
+            fresh_agent_name = await self._aux_unique_full_name_async(
+                already_generated_names=already,
+                context=self.context_text,
+            )
+            if isinstance(fresh_agent_name, str):
+                fresh_agent_name = fresh_agent_name.strip()
+
+            # Reserve name for this run to avoid races with other async tasks.
+            async with self._async_generation_lock:
+                if fresh_agent_name and fresh_agent_name not in TinyPersonFactory.all_unique_names:
+                    TinyPersonFactory.all_unique_names = list(
+                        set(TinyPersonFactory.all_unique_names + [fresh_agent_name])
+                    )
+
+            if agent_particularities is not None:
+                agent_particularities = f"""
+
+                - Primary characteristics: {agent_particularities}
+
+                - Also use the following additional characteristics:
+                    * Full name: {fresh_agent_name}
+
+                In case the primary characteristics already specify a name, please use the primary name and ignore the additional one.
+                """
+            else:
+                agent_particularities = f"Full name: {fresh_agent_name}"
+
+        logger.info(
+            f"Generating person with the following particularities: {agent_particularities}"
+        )
+
+        example_1 = json.load(
+            open(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "../examples/agents/Friedrich_Wolf.agent.json",
+                ),
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            )
+        )
+        example_2 = json.load(
+            open(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "../examples/agents/Sophie_Lefevre.agent.json",
+                ),
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            )
+        )
+
+        user_prompt = chevron.render(
+            open(
+                self.person_prompt_template_path,
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            ).read(),
+            {
+                "context": self.context_text,
+                "agent_particularities": agent_particularities,
+                "example_1": json.dumps(example_1["persona"], indent=4),
+                "example_2": json.dumps(example_2["persona"], indent=4),
+            },
+        )
+
+        async def aux_generate(attempt):
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a system that generates specifications for realistic simulations of people. You follow the generation rules and constraints carefully.",
+                },
+                {"role": "user", "content": user_prompt},
+            ]
+            message = await self._aux_model_call_async(
+                messages=messages, temperature=temperature
+            )
+
+            if message is not None:
+                result = utils.extract_json(message["content"])
+                try:
+                    name = result.get("name")
+                except Exception:
+                    name = None
+                if isinstance(name, str) and name:
+                    async with self._async_generation_lock:
+                        if not self._is_name_already_assigned(name):
+                            # Reserve globally to prevent races with other async tasks.
+                            if name not in TinyPersonFactory.all_unique_names:
+                                TinyPersonFactory.all_unique_names = list(
+                                    set(TinyPersonFactory.all_unique_names + [name])
+                                )
+                            return result
+                logger.info(
+                    f"Person with name {result.get('name')} was already generated, cannot be reused."
+                )
+
+            return None
+
+        agent_spec = None
+        attempt = 0
+        while agent_spec is None and attempt < attempts:
+            attempt += 1
+            try:
+                agent_spec = await aux_generate(attempt=attempt)
+            except Exception as e:
+                logger.error(f"Error while generating agent specification: {e}")
+
+        if agent_spec is not None:
+            async with self._async_generation_lock:
+                try:
+                    person = TinyPerson(agent_spec["name"])
+                except Exception as e:
+                    logger.error(f"Error while creating agent instance: {e}")
+                    return None
+
+                self._setup_agent(person, agent_spec)
+                if post_processing_func is not None:
+                    post_processing_func(person)
+
+                self.generated_minibios.append(person.minibio())
+                self.generated_names.append(person.get("name"))
+
+            return person
+
+        logger.error(f"Could not generate an agent after {attempts} attempts.")
+        if sampled_characteristics is not None:
+            async with self._async_generation_lock:
+                self.remaining_characteristics_sample.append(sampled_characteristics)
+        logger.error(
+            f"Name {fresh_agent_name} was not used, it will be added back to the pool of names."
+        )
+        return None
+
+    @config_manager.config_defaults(parallelize="parallel_agent_generation")
+    async def generate_people_async(
+        self,
+        number_of_people: int = None,
+        agent_particularities: str = None,
+        temperature: float = 1.0,
+        attempts: int = 10,
+        post_processing_func=None,
+        parallelize=None,
+        verbose: bool = False,
+        max_workers: Optional[int] = None,
+    ) -> list:
+        """
+        Async variant of `generate_people()`.
+        """
+        if number_of_people is None:
+            if self.population_size is None:
+                raise ValueError(
+                    "Either the number of people to generate or the population size must be specified."
+                )
+            number_of_people = self.population_size
+        elif self.population_size is None:
+            self.population_size = number_of_people
+        elif (
+            number_of_people is not None
+            and self.population_size is not None
+            and number_of_people > self.population_size
+        ):
+            raise ValueError(
+                f"Cannot generate more people than the population size. Requested {number_of_people}, but the population size is {self.population_size}."
+            )
+
+        if not parallelize:
+            people: list = []
+            for i in range(number_of_people):
+                person = await self.generate_person_async(
+                    agent_particularities=agent_particularities,
+                    temperature=temperature,
+                    attempts=attempts,
+                    post_processing_func=post_processing_func,
+                )
+                if person is not None:
+                    people.append(person)
+                    if verbose:
+                        logger.info(
+                            f"Generated person {i+1}/{number_of_people}: {person.minibio()}"
+                        )
+                else:
+                    logger.error(
+                        f"Could not generate person {i+1}/{number_of_people}. Continuing with the remaining ones."
+                    )
+            return people
+
+        if max_workers is None:
+            max_workers = config_manager.get("max_concurrent_model_calls")
+        if max_workers is None:
+            max_workers = number_of_people
+        max_workers = max(1, min(number_of_people, int(max_workers)))
+
+        semaphore = asyncio.Semaphore(max_workers)
+
+        async def worker(i: int):
+            async with semaphore:
+                person = await self.generate_person_async(
+                    agent_particularities=agent_particularities,
+                    temperature=temperature,
+                    attempts=attempts,
+                    post_processing_func=post_processing_func,
+                )
+                return i, person
+
+        tasks = [worker(i) for i in range(number_of_people)]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        people: list = []
+        for i, person in sorted(results, key=lambda t: t[0]):
+            if person is not None:
+                people.append(person)
+                if verbose:
+                    logger.info(
+                        f"Generated person {i+1}/{number_of_people}: {person.minibio()}"
+                    )
+            else:
+                logger.error(
+                    f"Could not generate person {i+1}/{number_of_people}. Continuing with the remaining ones."
+                )
+
+        return people
 
     @config_manager.config_defaults(parallelize="parallel_agent_generation")
     def generate_people(
@@ -1506,6 +2021,16 @@ class TinyPersonFactory(TinyFactory):
         we don't want that.
         """
         return client().send_message(
+            messages,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+
+    async def _aux_model_call_async(self, messages, temperature):
+        """
+        Async variant of `_aux_model_call`.
+        """
+        return await client().send_message_async(
             messages,
             temperature=temperature,
             response_format={"type": "json_object"},

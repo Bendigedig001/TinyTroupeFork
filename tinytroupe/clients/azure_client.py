@@ -3,7 +3,7 @@ import os
 
 import httpx
 import openai
-from openai import AzureOpenAI, OpenAI
+from openai import AsyncAzureOpenAI, AzureOpenAI, OpenAI
 
 from tinytroupe import config_manager
 
@@ -63,3 +63,57 @@ class AzureClient(OpenAIClient):
                 max_retries=0,  # we do our own retrying with customized exponential backoff
                 http_client=httpx_client
             )
+
+    @config_manager.config_defaults(timeout="timeout")
+    async def _setup_async_from_config(self, timeout=None):
+        """
+        Sets up the async Azure OpenAI Service API configurations for this client.
+        """
+        async with self._async_client_lock:
+            # If already configured for this timeout, keep it.
+            if self._async_client is not None and self._async_client_timeout == timeout:
+                return
+
+            if self._async_http_client is not None:
+                try:
+                    await self._async_http_client.aclose()
+                except Exception:
+                    pass
+
+            httpx_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    timeout=timeout,      # Overall timeout
+                    connect=10.0,         # Connection timeout (fixed at 10s)
+                    read=timeout,         # Read timeout (from config)
+                    write=10.0,           # Write timeout (fixed at 10s)
+                    pool=5.0              # Pool timeout (fixed at 5s)
+                )
+            )
+
+            self._async_http_client = httpx_client
+            self._async_client_timeout = timeout
+
+            if os.getenv("AZURE_OPENAI_KEY"):
+                logger.info("Using Azure OpenAI Service API with key (async)...")
+                self._async_client = AsyncAzureOpenAI(
+                    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+                    api_version=config_manager.get("AZURE_API_VERSION"),
+                    api_key=os.getenv("AZURE_OPENAI_KEY"),
+                    max_retries=0,
+                    http_client=httpx_client,
+                )
+            else:
+                logger.info("Using Azure OpenAI Service API with Entra ID Auth (async).")
+                from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+                credential = DefaultAzureCredential()
+                token_provider = get_bearer_token_provider(
+                    credential, "https://cognitiveservices.azure.com/.default"
+                )
+                self._async_client = AsyncAzureOpenAI(
+                    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+                    api_version=config_manager.get("AZURE_API_VERSION"),
+                    azure_ad_token_provider=token_provider,
+                    max_retries=0,
+                    http_client=httpx_client,
+                )

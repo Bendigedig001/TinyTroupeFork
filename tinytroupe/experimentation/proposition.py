@@ -244,6 +244,109 @@ class Proposition:
         else:
             return self.full_evaluation_response
 
+    async def check_async(
+        self,
+        target=None,
+        additional_context="No additional context available.",
+        claim_variables: dict = {},
+        return_full_response: bool = False,
+    ) -> bool:
+        """
+        Async variant of `check()`.
+        """
+        current_targets = self._determine_target(target)
+
+        if (
+            self._check_precondition(
+                target=current_targets,
+                additional_context=additional_context,
+                claim_variables=claim_variables,
+            )
+            == False
+        ):
+            self.value = True
+            self.justification = (
+                "The proposition is trivially true due to the precondition being false."
+            )
+            self.confidence = 1.0
+            self.full_evaluation_response = {
+                "value": True,
+                "justification": self.justification,
+                "confidence": self.confidence,
+            }
+        else:
+            context = self._build_context(current_targets)
+            model = self._model(self.use_reasoning_model)
+            rendered_claim = render(self.claim, claim_variables)
+
+            self.llm_chat = LLMChat(
+                system_prompt="""
+                                        You are a system that evaluates whether a proposition is true or false with respect to a given context. This context
+                                        always refers to a multi-agent simulation. The proposition is a claim about the behavior of the agents or the state of their environment
+                                        in the simulation.
+                                    
+                                        The context you receive can contain one or more of the following:
+                                        - the trajectory of a simulation of one or more agents. This means what agents said, did, thought, or perceived at different times.
+                                        - the state of the environment at a given time.
+                                    
+                                        Your output **must**:
+                                        - necessarily start with the word "True" or "False";
+                                        - optionally be followed by a justification. Please provide a very detailed justifications, including very concrete and specific mentions to elements that contributed to reducing or increasing the score. Examples:
+                                              * WRONG JUSTIFICATION (too abstract) example: " ... the agent behavior did not comply with key parts of its specification, thus a reduced score ... "
+                                              * CORRECT JUSTIFICATION (very precise) example: " ... the agent behavior deviated from key parts of its specification, specifically: S_1 was not met because <reason>, ..., S_n was not met becasue <reason>. Thus, a reduced score ..."
+                                        
+                                        For example, the output could be of the form: "True, because <HIGHLY DETAILED, CONCRETE AND SPECIFIC REASONS HERE>." or merely "True" if no justification is needed.
+                                        """,
+                user_prompt=f"""
+                                        Evaluate the following proposition with respect to the context provided. Is it True or False?
+
+                                        # Proposition
+
+                                        This is the proposition you must evaluate:
+
+                                            ```
+                                            {indent_at_current_level(rendered_claim)}
+                                            ```
+
+                                        # Context
+
+                                        The context you must consider is the following.
+
+                                        {indent_at_current_level(context)}
+
+                                        # Additional Context (if any)
+
+                                        {indent_at_current_level(additional_context)}
+
+                                        """,
+                output_type=bool,
+                enable_reasoning_step=True,
+                temperature=1.0,
+                model=model,
+            )
+
+            self.value = await self.llm_chat.call_async()
+
+            if self.double_check:
+                self.llm_chat.add_user_message(
+                    "Are you sure? Please revise your evaluation to make is correct as possible."
+                )
+                revised_value = await self.llm_chat.call_async()
+                if revised_value != self.value:
+                    logger.warning(
+                        f"The LLM revised its evaluation: from {self.value} to {revised_value}."
+                    )
+                    self.value = revised_value
+
+            self.reasoning = self.llm_chat.response_reasoning
+            self.justification = self.llm_chat.response_justification
+            self.confidence = self.llm_chat.response_confidence
+            self.full_evaluation_response = self.llm_chat.response_json
+
+        if not return_full_response:
+            return self.value
+        return self.full_evaluation_response
+
     def score(
         self,
         target=None,
@@ -393,6 +496,124 @@ class Proposition:
             return self.value
         else:
             return self.full_evaluation_response
+
+    async def score_async(
+        self,
+        target=None,
+        additional_context="No additional context available.",
+        claim_variables: dict = {},
+        return_full_response: bool = False,
+    ) -> int:
+        """
+        Async variant of `score()`.
+        """
+        current_targets = self._determine_target(target)
+
+        if (
+            self._check_precondition(
+                target=current_targets,
+                additional_context=additional_context,
+                claim_variables=claim_variables,
+            )
+            == False
+        ):
+            self.value = self.MAX_SCORE
+            self.justification = (
+                "The proposition is trivially true due to the precondition being false."
+            )
+            self.confidence = 1.0
+            self.full_evaluation_response = {
+                "value": self.value,
+                "justification": self.justification,
+                "confidence": self.confidence,
+            }
+        else:
+            context = self._build_context(current_targets)
+            model = self._model(self.use_reasoning_model)
+            rendered_claim = render(self.claim, claim_variables)
+
+            # Reuse the same prompts as `score()`
+            self.llm_chat = LLMChat(
+                system_prompt=f"""
+                                        You are a system that computes an integer score (between {Proposition.MIN_SCORE} and {Proposition.MAX_SCORE}, inclusive) about how much a proposition is true or false with respect to a given context. 
+                                        This context always refers to a multi-agent simulation. The proposition is a claim about the behavior of the agents or the state of their environment in the simulation.
+
+                                        The minimum score of {Proposition.MIN_SCORE} means that the proposition is completely false in all of the simulation trajectories, while the maximum score of {Proposition.MAX_SCORE} means that the proposition is completely true in all of the simulation trajectories. Intermediate scores are used to express varying degrees of partially met expectations. When assigning a score, follow these guidelines:
+                                        - If the data required to judge the proposition is not present, assign a score of {Proposition.MAX_SCORE}. That is to say, unless there is evidence to the contrary, the proposition is assumed to be true.
+                                        - The maximum score of {Proposition.MAX_SCORE} should be assigned when the evidence is as good as it can be. That is to say, all parts of the observed simulation trajectory support the proposition, no exceptions.
+                                        - The minimum score of {Proposition.MIN_SCORE} should be assigned when the evidence is as bad as it can be. That is to say, all parts of the observed simulation trajectory contradict the proposition, no exceptions.
+                                        - Intermediate scores should be assigned when the evidence is mixed. The intermediary score should be proportional to the balance of evidence, according to these bands:
+                                                  0 = The proposition is without any doubt completely false;
+                                            1, 2, 3 = The proposition has little support and is mostly false;
+                                               4, 5 = The evidence is mixed, and the proposition is as much true as it is false;
+                                            6, 7, 8 = The proposition is well-supported and is mostly true;
+                                                  9 = The proposition is without any doubt completely true.
+                                        - You should be very rigorous in your evaluation and, when in doubt, assign a lower score.
+                                        - If there are critical flaws in the evidence, you should move your score to a lower band entirely.
+                                        - If the provided context has inconsistent information, you **must** consider **only** the information that gives the lowest score, since we want to be rigorous and if necessary err to the lower end.
+                                          * If you are considering the relationship between an agent specification and a simulation trajectory, you should consider the worst possible interpretation of: the agent specification; the simulation trajectory; or the relationship between the two.
+
+                                        Additionally, follow these rules for evaluating the simulation context:
+                                          - The context contains a sequence of interactions. An interaction can be a stimulus or an action, and it is always marked as such.
+                                          - Actions are clearly marked with the text "acts", e.g., "Agent A acts: [ACTION]". If it is not thus marked, it is not an action.
+                                          - Stimuli are denoted by "--> Agent name: [STIMULUS]".
+                                    
+                                        Your output **must**:
+                                          - necessarily start with an integer between {Proposition.MIN_SCORE} and {Proposition.MAX_SCORE}, inclusive;
+                                          - be followed by a justification. Please provide a very detailed justifications, including very concrete and specific mentions to elements that contributed to reducing or increasing the score. Examples:
+                                              * WRONG JUSTIFICATION (too abstract) example: " ... the agent behavior did not comply with key parts of its specification, thus a reduced score ... "
+                                              * CORRECT JUSTIFICATION (very precise) example: " ... the agent behavior deviated from key parts of its specification, specifically: S_1 was not met because <reason>, ..., S_n was not met becasue <reason>. Thus, a reduced score ..."
+                                        
+                                        For example, the output could be of the form: "1, because <HIGHLY DETAILED, CONCRETE AND SPECIFIC REASONS HERE>."
+                                        """,
+                user_prompt=f"""
+                                        Compute the score for the following proposition with respect to the context provided. Think step-by-step to assign the most accurate score and provide a justification.
+
+                                        # Proposition
+
+                                        This is the proposition you must evaluate:
+                                        
+                                            ```
+                                            {indent_at_current_level(rendered_claim)}
+                                            ```
+
+                                        # Context
+
+                                        The context you must consider is the following.
+
+                                        {indent_at_current_level(context)}
+
+                                        # Additional Context (if any)
+
+                                        {indent_at_current_level(additional_context)}   
+                                        """,
+                output_type=int,
+                enable_reasoning_step=True,
+                temperature=1.0,
+                model=model,
+            )
+
+            self.value = await self.llm_chat.call_async()
+
+            if self.double_check:
+                self.llm_chat.add_user_message(
+                    "Are you sure? Please revise your evaluation to make is correct as possible."
+                )
+                revised_value = await self.llm_chat.call_async()
+                if revised_value != self.value:
+                    logger.warning(
+                        f"The LLM revised its evaluation: from {self.value} to {revised_value}."
+                    )
+                    self.value = revised_value
+
+            self.reasoning = self.llm_chat.response_reasoning
+            self.justification = self.llm_chat.response_justification
+            self.confidence = self.llm_chat.response_confidence
+            self.full_evaluation_response = self.llm_chat.response_json
+
+        if not return_full_response:
+            return self.value
+        return self.full_evaluation_response
 
     def recommendations_for_improvement(self):
         """

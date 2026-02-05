@@ -826,6 +826,209 @@ class TinyPerson(JsonSerializableRegistry):
         if return_actions:
             return contents
 
+    @config_manager.config_defaults(max_content_length="max_content_display_length")
+    async def act_async(
+        self,
+        until_done=True,
+        n=None,
+        return_actions=False,
+        max_content_length=None,
+        communication_display: bool = None,
+    ):
+        """
+        Async variant of `act()`. This avoids thread pools and uses `await` all the way
+        down to the LLM client.
+        """
+
+        assert not (until_done and n is not None)
+        if n is not None:
+            assert n < TinyPerson.MAX_ACTIONS_BEFORE_DONE
+
+        contents = []
+
+        def aux_pre_act():
+            pass
+
+        def _commit_action(action, role, content):
+            next_action_similarity = utils.next_action_jaccard_similarity(self, action)
+            if (
+                self.enable_basic_action_repetition_prevention
+                and (TinyPerson.MAX_ACTION_SIMILARITY is not None)
+                and (next_action_similarity > TinyPerson.MAX_ACTION_SIMILARITY)
+            ):
+                logger.warning(
+                    f"[{self.name}] Action similarity is too high ({next_action_similarity}), replacing it with DONE."
+                )
+                action = {"type": "DONE", "content": "", "target": ""}
+
+                self.store_in_memory(
+                    {
+                        "role": "system",
+                        "content": f"""
+                                        # EXCESSIVE ACTION SIMILARITY WARNING
+
+                                        You were about to generate a repetitive action (jaccard similarity = {next_action_similarity}).
+                                        Thus, the action was discarded and replaced by an artificial DONE.
+
+                                        DO NOT BE REPETITIVE. This is not a human-like behavior, therefore you **must** avoid this in the future.
+                                        Your alternatives are:
+                                        - produce more diverse actions.
+                                        - aggregate similar actions into a single, larger, action and produce it all at once.
+                                        - as a **last resort only**, you may simply not acting at all by issuing a DONE.
+
+                                        
+                                        """,
+                        "type": "feedback",
+                        "simulation_timestamp": self.iso_datetime(),
+                    }
+                )
+
+            content_for_memory = {"action": action}
+            if isinstance(content, dict) and "cognitive_state" in content:
+                content_for_memory["cognitive_state"] = content["cognitive_state"]
+
+            self.store_in_memory(
+                {
+                    "role": role,
+                    "content": content_for_memory,
+                    "type": "action",
+                    "simulation_timestamp": self.iso_datetime(),
+                }
+            )
+
+            self._actions_buffer.append(action)
+
+            if isinstance(content, dict) and "cognitive_state" in content:
+                cognitive_state = content["cognitive_state"]
+                logger.debug(f"[{self.name}] Cognitive state: {cognitive_state}")
+                self._update_cognitive_state(
+                    goals=cognitive_state.get("goals", None),
+                    context=cognitive_state.get("context", None),
+                    attention=cognitive_state.get("emotions", None),
+                    emotions=cognitive_state.get("emotions", None),
+                )
+
+            contents.append(
+                {
+                    "action": action,
+                    "cognitive_state": content_for_memory.get("cognitive_state", {}),
+                }
+            )
+            if utils.first_non_none(
+                communication_display, TinyPerson.communication_display
+            ):
+                self._display_communication(
+                    role=role,
+                    content={
+                        "action": action,
+                        "cognitive_state": content_for_memory.get(
+                            "cognitive_state", {}
+                        ),
+                    },
+                    kind="action",
+                    simplified=True,
+                    max_content_length=max_content_length,
+                )
+
+            for faculty in self._mental_faculties:
+                faculty.process_action(self, action)
+
+            self.actions_count += 1
+
+        async def aux_act_once_sequence():
+            for _attempt in range(5):
+                try:
+                    self.reset_prompt()
+
+                    def _latest_stimuli_payload():
+                        try:
+                            recent = self.episodic_memory.retrieve_recent()
+                            for msg in reversed(recent):
+                                if (
+                                    msg.get("role") == "user"
+                                    and msg.get("type") == "stimulus"
+                                ):
+                                    return msg.get("content")
+                        except Exception:
+                            return None
+                        return None
+
+                    stimuli_payload = _latest_stimuli_payload()
+                    if stimuli_payload:
+                        self.current_messages.append(
+                            {
+                                "role": "user",
+                                "content": stimuli_payload,
+                            }
+                        )
+
+                    actions, role, content, _all_negative_feedbacks = (
+                        await self.action_generator.generate_next_actions_async(
+                            self, self.current_messages
+                        )
+                    )
+
+                    if len(actions) > 0 and len(actions) > TinyPerson.MAX_ACTIONS_BEFORE_DONE:
+                        actions = actions[: TinyPerson.MAX_ACTIONS_BEFORE_DONE]
+                        if actions[-1] is not None and isinstance(actions[-1], dict) and actions[-1].get("type") != "DONE":
+                            actions[-1] = {"type": "DONE", "content": "", "target": ""}
+
+                    for action in actions:
+                        if action is None or not isinstance(action, dict):
+                            logger.warning(f"[{self.name}] Skipping invalid action: {action}")
+                            continue
+                        _commit_action(action, role, content)
+                        if action.get("type") == "DONE":
+                            break
+
+                    return
+
+                except (KeyError, TypeError) as e:
+                    if _attempt >= 4:
+                        raise
+                    logger.warning(f"[{self.name}] act_async retry due to {type(e).__name__}: {e}")
+
+        if n is not None:
+            remaining = n
+            while remaining > 0:
+                aux_pre_act()
+                before = self.actions_count
+                await aux_act_once_sequence()
+                produced = self.actions_count - before
+                remaining -= produced
+                if remaining <= 0:
+                    break
+
+        elif until_done:
+            aux_pre_act()
+            await aux_act_once_sequence()
+
+        self.consolidate_episode_memories()
+
+        if return_actions:
+            return contents
+
+    async def listen_and_act_async(
+        self,
+        speech,
+        return_actions=False,
+        max_content_length=None,
+        communication_display: bool = None,
+    ):
+        """
+        Async convenience method that combines `listen()` and `act_async()`.
+        """
+        self.listen(
+            speech,
+            max_content_length=max_content_length,
+            communication_display=communication_display,
+        )
+        return await self.act_async(
+            return_actions=return_actions,
+            max_content_length=max_content_length,
+            communication_display=communication_display,
+        )
+
     @transactional()
     @config_manager.config_defaults(max_content_length="max_content_display_length")
     def listen(

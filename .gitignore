@@ -6,6 +6,7 @@ tests_cache.pickle
 *.local.*
 .VSCodeCounter/
 .vscode/
+.tinytroupe_uk_borda_cache/
 
 outputs/
 
