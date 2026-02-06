@@ -39,6 +39,27 @@ def test_generate_person(setup):
     ), f"Proposition is false according to the LLM."
 
 
+@pytest.mark.core
+def test_generate_person_failure_path_returns_none_without_unboundlocalerror(
+    monkeypatch, setup
+):
+    factory = TinyPersonFactory(context="A tiny deterministic test context.")
+
+    monkeypatch.setattr(
+        factory,
+        "_unique_full_name",
+        lambda already_generated_names, context: "Reserved Test Name",
+    )
+    monkeypatch.setattr(factory, "_aux_model_call", lambda messages, temperature: None)
+
+    person = factory.generate_person(
+        "A person for a forced-failure path test.",
+        attempts=1,
+    )
+
+    assert person is None
+
+
 def test_generate_person_with_different_temperatures(setup):
     """Test person generation with different temperature settings.
     Note: This test only runs for models that contain 'gpt-4' in their name,

@@ -685,7 +685,7 @@ class LLMChat:
             # Call the LLM model with all messages in the conversation
             model_output = client().send_message(self.messages, **self.model_params)
 
-            if "content" in model_output:
+            if isinstance(model_output, dict) and "content" in model_output:
                 self.response_raw = self.response_value = model_output["content"]
                 logger.debug(f"Model raw 'content'  response: {self.response_raw}")
 
@@ -1012,7 +1012,7 @@ class LLMChat:
                 self.messages, **self.model_params
             )
 
-            if "content" in model_output:
+            if isinstance(model_output, dict) and "content" in model_output:
                 self.response_raw = self.response_value = model_output["content"]
                 logger.debug(f"Model raw 'content'  response: {self.response_raw}")
 

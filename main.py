@@ -24,9 +24,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-from tinytroupe.utils.images import ImageSpec, build_image_content_part, preprocess_image_cached
-
-
 def uk_population_sample() -> dict[str, Any]:
     # This is intentionally small and human-readable (prompt context, not parsed programmatically).
     return {
@@ -110,10 +107,19 @@ class ImageDefaults:
 
 
 @dataclass(frozen=True)
+class LocalImageSpec:
+    path: str
+    detail: str = "low"
+    max_dim: int = 768
+    format: str = "jpeg"
+    quality: int = 85
+
+
+@dataclass(frozen=True)
 class OptionSpec:
     id: str
     label: str
-    images: list[ImageSpec]
+    images: list[LocalImageSpec]
 
 
 def _default_option_specs() -> list[OptionSpec]:
@@ -203,7 +209,7 @@ def _load_options_spec(
                     if not img_path:
                         continue
                     images.append(
-                        ImageSpec(
+                        LocalImageSpec(
                             path=img_path,
                             detail=img_spec.get("detail", image_defaults.detail),
                             max_dim=int(img_spec.get("max_dim", image_defaults.max_dim)),
@@ -229,11 +235,22 @@ def _build_question_payload(
     if not has_images:
         return question_text, image_fingerprints
 
+    TinyImageSpec, build_image_content_part, preprocess_image_cached = (
+        _silent_import_image_utils()
+    )
+
     parts: list[dict] = []
     for opt in options:
         opt_images: list[dict] = []
         for img in opt.images:
-            asset = preprocess_image_cached(img, cache_dir)
+            image_spec = TinyImageSpec(
+                path=img.path,
+                detail=img.detail,
+                max_dim=img.max_dim,
+                format=img.format,
+                quality=img.quality,
+            )
+            asset = preprocess_image_cached(image_spec, cache_dir)
             opt_images.append(
                 {
                     "source_sha256": asset.source_sha256,
@@ -318,6 +335,30 @@ class PersonResponse:
     raw_talk: str
     ranking: list[str]
     borda_points: dict[str, int]
+
+
+_IMAGE_UTILS = None
+
+
+def _silent_import_image_utils():
+    global _IMAGE_UTILS
+    if _IMAGE_UTILS is not None:
+        return _IMAGE_UTILS
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        from tinytroupe.utils.images import (  # type: ignore
+            ImageSpec as TinyImageSpec,
+            build_image_content_part,
+            preprocess_image_cached,
+        )
+
+    _IMAGE_UTILS = (
+        TinyImageSpec,
+        build_image_content_part,
+        preprocess_image_cached,
+    )
+    return _IMAGE_UTILS
 
 
 def _silent_import_tinytroupe():
@@ -508,6 +549,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         type=int,
         default=2048,
         help="Max completion tokens for model calls (default: 2048).",
+    )
+    parser.add_argument(
+        "--prompt-cache-retention",
+        choices=["in_memory", "24h", "off"],
+        default="in_memory",
+        help="OpenAI prompt cache retention (default: in_memory). Use 'off' to disable for this run.",
     )
     parser.add_argument(
         "--options-json",
@@ -765,6 +812,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 config_manager.update("timeout", args.timeout)
                 config_manager.update("max_completion_tokens", args.max_completion_tokens)
                 config_manager.update("max_attempts", 2)
+                prompt_cache_retention = (
+                    None
+                    if args.prompt_cache_retention == "off"
+                    else args.prompt_cache_retention
+                )
+                config_manager.update(
+                    "prompt_cache_retention", prompt_cache_retention
+                )
                 if args.model:
                     config_manager.update("model", args.model)
                 try:

@@ -335,6 +335,50 @@ class TinyPerson(JsonSerializableRegistry):
         self.name = new_name
         self._persona["name"] = self.name
 
+    def _latest_stimuli_payload(self):
+        try:
+            recent = self.episodic_memory.retrieve_recent()
+            for msg in reversed(recent):
+                if msg.get("role") == "user" and msg.get("type") == "stimulus":
+                    # Content already has {"stimuli": [...]} as stored by _observe.
+                    return msg.get("content")
+        except Exception:
+            return None
+        return None
+
+    def _build_user_message_from_stimuli(self, payload: Any) -> dict:
+        # Default: pass through payload as-is.
+        if not isinstance(payload, dict):
+            return {"role": "user", "content": payload}
+
+        supports_images = config_manager.get("api_type") in {"openai", "azure"}
+        multimodal_parts: list[dict] = []
+        simplified = copy.deepcopy(payload)
+
+        for stim in simplified.get("stimuli", []) or []:
+            content = stim.get("content")
+            normalized = _normalize_multimodal_content(content)
+            if normalized is None:
+                continue
+            text_value, parts = normalized
+            stim["content"] = _summarize_multimodal_text(text_value, parts)
+            if supports_images and parts:
+                multimodal_parts.extend(parts)
+
+        if supports_images and multimodal_parts:
+            return {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(simplified, ensure_ascii=False),
+                    },
+                    *multimodal_parts,
+                ],
+            }
+
+        return {"role": "user", "content": simplified}
+
     def generate_agent_system_prompt(self):
         with open(
             self._prompt_template_path, "r", encoding="utf-8", errors="replace"
@@ -801,60 +845,11 @@ class TinyPerson(JsonSerializableRegistry):
             # ensure we have the latest prompt
             self.reset_prompt()
 
-            # Provide latest perceived stimuli explicitly in a user JSON message
-            def _latest_stimuli_payload():
-                try:
-                    # Walk recent episodic memory from newest to oldest to find the last stimulus block
-                    recent = self.episodic_memory.retrieve_recent()
-                    for msg in reversed(recent):
-                        if msg.get("role") == "user" and msg.get("type") == "stimulus":
-                            # Content already has {"stimuli": [...]} as stored by _observe
-                            return msg.get("content")
-                except Exception:
-                    return None
-                return None
-
-            stimuli_payload = _latest_stimuli_payload()
+            stimuli_payload = self._latest_stimuli_payload()
             if stimuli_payload:
-                def _build_user_message_from_stimuli(payload: dict) -> dict:
-                    # Default: pass through JSON payload
-                    if not isinstance(payload, dict):
-                        return {"role": "user", "content": payload}
-
-                    supports_images = config_manager.get("api_type") in {"openai", "azure"}
-                    multimodal_parts: list[dict] = []
-                    simplified = copy.deepcopy(payload)
-
-                    for stim in simplified.get("stimuli", []) or []:
-                        content = stim.get("content")
-                        normalized = _normalize_multimodal_content(content)
-                        if normalized is None:
-                            continue
-                        text_value, parts = normalized
-                        stim["content"] = _summarize_multimodal_text(text_value, parts)
-                        if supports_images and parts:
-                            # For dict-based multimodal content we already extracted non-text parts.
-                            # For list-based content we keep all parts to preserve ordering.
-                            if isinstance(content, dict) and isinstance(content.get("parts"), list):
-                                multimodal_parts.extend(parts)
-                            else:
-                                multimodal_parts.extend(parts)
-
-                    if supports_images and multimodal_parts:
-                        return {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": json.dumps(simplified, ensure_ascii=False),
-                                }
-                            ]
-                            + multimodal_parts,
-                        }
-
-                    return {"role": "user", "content": simplified}
-
-                self.current_messages.append(_build_user_message_from_stimuli(stimuli_payload))
+                self.current_messages.append(
+                    self._build_user_message_from_stimuli(stimuli_payload)
+                )
 
             actions_or_action, role, content, all_negative_feedbacks = (
                 self.action_generator.generate_next_actions(self, self.current_messages)
@@ -1022,26 +1017,10 @@ class TinyPerson(JsonSerializableRegistry):
                 try:
                     self.reset_prompt()
 
-                    def _latest_stimuli_payload():
-                        try:
-                            recent = self.episodic_memory.retrieve_recent()
-                            for msg in reversed(recent):
-                                if (
-                                    msg.get("role") == "user"
-                                    and msg.get("type") == "stimulus"
-                                ):
-                                    return msg.get("content")
-                        except Exception:
-                            return None
-                        return None
-
-                    stimuli_payload = _latest_stimuli_payload()
+                    stimuli_payload = self._latest_stimuli_payload()
                     if stimuli_payload:
                         self.current_messages.append(
-                            {
-                                "role": "user",
-                                "content": stimuli_payload,
-                            }
+                            self._build_user_message_from_stimuli(stimuli_payload)
                         )
 
                     actions, role, content, _all_negative_feedbacks = (

@@ -269,6 +269,7 @@ class TinyPersonFactory(TinyFactory):
         logger.debug(
             f"Starting the person generation based these particularities: {agent_particularities}"
         )
+        sampled_characteristics = None
         fresh_agent_name = None
 
         # are we going to use a pre-computed sample of characteristics too?
@@ -446,7 +447,7 @@ class TinyPersonFactory(TinyFactory):
             if sampled_characteristics is not None:
                 self.remaining_characteristics_sample.append(sampled_characteristics)
                 logger.error(
-                    f"Name {fresh_agent_name} was not used, it will be added back to the pool of names."
+                    "Sampled characteristics were returned to the pool after generation failure."
                 )
 
             return None
@@ -676,6 +677,31 @@ class TinyPersonFactory(TinyFactory):
         )
         sampled_characteristics = None
         fresh_agent_name = None
+        reserved_seed_name = None
+
+        def _try_reserve_global_name(
+            candidate_name: Any, allow_pre_reserved: bool = False
+        ) -> str | None:
+            if not isinstance(candidate_name, str):
+                return None
+
+            normalized_name = candidate_name.strip()
+            if not normalized_name:
+                return None
+
+            with concurrent_agent_generataion_lock:
+                if normalized_name in TinyPerson.all_agents_names():
+                    return None
+
+                if normalized_name in TinyPersonFactory.all_unique_names:
+                    if allow_pre_reserved:
+                        return normalized_name
+                    return None
+
+                TinyPersonFactory.all_unique_names = list(
+                    set(TinyPersonFactory.all_unique_names + [normalized_name])
+                )
+                return normalized_name
 
         if self.population_size is not None:
             await self.initialize_sampling_plan_async()
@@ -689,6 +715,11 @@ class TinyPersonFactory(TinyFactory):
                     )
                     return None
                 sampled_characteristics = self.remaining_characteristics_sample.pop()
+
+            if isinstance(sampled_characteristics, dict):
+                sampled_name = sampled_characteristics.get("name")
+                if isinstance(sampled_name, str):
+                    reserved_seed_name = sampled_name.strip()
 
             if agent_particularities is not None:
                 agent_particularities = f"""
@@ -709,21 +740,25 @@ class TinyPersonFactory(TinyFactory):
                          {json.dumps(sampled_characteristics, indent=4)}
                     """
         else:
-            # Generate a fresh name without holding locks across awaits.
-            already = TinyPersonFactory._all_used_and_precomputed_names()
-            fresh_agent_name = await self._aux_unique_full_name_async(
-                already_generated_names=already,
-                context=self.context_text,
-            )
-            if isinstance(fresh_agent_name, str):
-                fresh_agent_name = fresh_agent_name.strip()
+            # Generate and reserve a fresh globally unique name for this run.
+            for _name_attempt in range(max(1, attempts)):
+                already = TinyPersonFactory._all_used_and_precomputed_names()
+                candidate_name = await self._aux_unique_full_name_async(
+                    already_generated_names=already,
+                    context=self.context_text,
+                )
+                reserved_name = _try_reserve_global_name(candidate_name)
+                if reserved_name is not None:
+                    fresh_agent_name = reserved_name
+                    reserved_seed_name = reserved_name
+                    break
+                logger.info(
+                    f"Person with name {candidate_name} was already generated, cannot be reused."
+                )
 
-            # Reserve name for this run to avoid races with other async tasks.
-            async with self._async_generation_lock:
-                if fresh_agent_name and fresh_agent_name not in TinyPersonFactory.all_unique_names:
-                    TinyPersonFactory.all_unique_names = list(
-                        set(TinyPersonFactory.all_unique_names + [fresh_agent_name])
-                    )
+            if fresh_agent_name is None:
+                logger.error("Could not reserve a unique name for async generation.")
+                return None
 
             if agent_particularities is not None:
                 agent_particularities = f"""
@@ -798,15 +833,19 @@ class TinyPersonFactory(TinyFactory):
                     name = result.get("name")
                 except Exception:
                     name = None
-                if isinstance(name, str) and name:
-                    async with self._async_generation_lock:
-                        if not self._is_name_already_assigned(name):
-                            # Reserve globally to prevent races with other async tasks.
-                            if name not in TinyPersonFactory.all_unique_names:
-                                TinyPersonFactory.all_unique_names = list(
-                                    set(TinyPersonFactory.all_unique_names + [name])
-                                )
-                            return result
+
+                allow_pre_reserved = (
+                    isinstance(name, str)
+                    and isinstance(reserved_seed_name, str)
+                    and name.strip() == reserved_seed_name
+                )
+                reserved_name = _try_reserve_global_name(
+                    name,
+                    allow_pre_reserved=allow_pre_reserved,
+                )
+                if reserved_name is not None:
+                    result["name"] = reserved_name
+                    return result
                 logger.info(
                     f"Person with name {result.get('name')} was already generated, cannot be reused."
                 )
@@ -823,6 +862,19 @@ class TinyPersonFactory(TinyFactory):
                 logger.error(f"Error while generating agent specification: {e}")
 
         if agent_spec is not None:
+            if (
+                self.population_size is None
+                and isinstance(reserved_seed_name, str)
+                and isinstance(agent_spec.get("name"), str)
+                and agent_spec.get("name") != reserved_seed_name
+            ):
+                with concurrent_agent_generataion_lock:
+                    TinyPersonFactory.all_unique_names = [
+                        n
+                        for n in TinyPersonFactory.all_unique_names
+                        if n != reserved_seed_name
+                    ]
+
             async with self._async_generation_lock:
                 try:
                     person = TinyPerson(agent_spec["name"])
@@ -843,9 +895,17 @@ class TinyPersonFactory(TinyFactory):
         if sampled_characteristics is not None:
             async with self._async_generation_lock:
                 self.remaining_characteristics_sample.append(sampled_characteristics)
-        logger.error(
-            f"Name {fresh_agent_name} was not used, it will be added back to the pool of names."
-        )
+            logger.error(
+                "Sampled characteristics were returned to the pool after generation failure."
+            )
+        elif isinstance(reserved_seed_name, str):
+            with concurrent_agent_generataion_lock:
+                TinyPersonFactory.all_unique_names = [
+                    n for n in TinyPersonFactory.all_unique_names if n != reserved_seed_name
+                ]
+            logger.error(
+                f"Name {reserved_seed_name} was not used, it was returned to the pool of names."
+            )
         return None
 
     @config_manager.config_defaults(parallelize="parallel_agent_generation")
@@ -1103,12 +1163,14 @@ class TinyPersonFactory(TinyFactory):
             )
             if person is not None:
                 people.append(person)
+            else:
+                logger.error(f"Could not generate person {i+1}/{number_of_people}.")
+                continue
+
             info_msg = f"Generated person {i+1}/{number_of_people}: {person.minibio()}"
             logger.info(info_msg)
             if verbose:
                 print(info_msg)
-            else:
-                logger.error(f"Could not generate person {i+1}/{number_of_people}.")
 
         return people
 

@@ -90,6 +90,75 @@ class OpenAIClient:
 
         return candidate
 
+    @staticmethod
+    def _requires_json_keyword(response_format) -> bool:
+        """
+        Returns True when OpenAI's `json_object` mode is requested.
+        """
+        return (
+            isinstance(response_format, dict)
+            and response_format.get("type") == "json_object"
+        )
+
+    @classmethod
+    def _has_explicit_json_object_instruction(cls, messages) -> bool:
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "system":
+                continue
+
+            content = message.get("content")
+            text_chunks: list[str] = []
+            if isinstance(content, str):
+                text_chunks.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if (
+                        isinstance(part, dict)
+                        and part.get("type") in {"text", "input_text"}
+                        and isinstance(part.get("text"), str)
+                    ):
+                        text_chunks.append(part["text"])
+
+            if not text_chunks:
+                continue
+
+            lowered = " ".join(text_chunks).lower()
+            if "json object" in lowered or "valid json" in lowered:
+                return True
+
+        return False
+
+    @classmethod
+    def _ensure_json_keyword_in_messages(cls, current_messages, response_format):
+        """
+        Ensures API payload satisfies OpenAI's json_object requirement without mutating caller state.
+        """
+        if not cls._requires_json_keyword(response_format):
+            return list(current_messages)
+
+        safe_messages = [
+            dict(message) if isinstance(message, dict) else message
+            for message in current_messages
+        ]
+
+        json_reminder = {
+            "role": "system",
+            "content": "Return a valid json object and nothing else.",
+        }
+
+        if cls._has_explicit_json_object_instruction(safe_messages):
+            return safe_messages
+
+        # Keep the very first system message as anchor to preserve prompt-cache locality.
+        if (
+            safe_messages
+            and isinstance(safe_messages[0], dict)
+            and safe_messages[0].get("role") == "system"
+        ):
+            return [safe_messages[0], json_reminder, *safe_messages[1:]]
+
+        return [json_reminder, *safe_messages]
+
     @config_manager.config_defaults(cache_file_name="cache_file_name")
     def set_api_cache(self, cache_api_calls, cache_file_name=None):
         """
@@ -274,6 +343,11 @@ class OpenAIClient:
         # setup the OpenAI configurations for this client.
         self._setup_from_config()
 
+        # Avoid mutating caller-managed message history in place.
+        current_messages = self._ensure_json_keyword_in_messages(
+            current_messages, response_format
+        )
+
         # dedent the messages (field 'content' only) if needed (using textwrap)
         if dedent_messages:
             for message in current_messages:
@@ -350,6 +424,7 @@ class OpenAIClient:
                         if pre_cached_response is not None
                         else self._get_cached_response(cache_key)
                     )
+                    was_cached = cached_response is not None
 
                     if cached_response is not None:
                         response = cached_response
@@ -369,12 +444,15 @@ class OpenAIClient:
                                         self.api_cache[cache_key] = cacheable_response
                                         self._save_cache()
                                 else:
-                                    response = existing
+                                    reconstructed = self._from_cached_format(existing)
+                                    if reconstructed is not None:
+                                        response = reconstructed
+                                        was_cached = True
 
                     raw_message = self._raw_model_response_extractor(response)
 
                     # Update cost statistics
-                    self._update_cost_stats(response, cached_response is not None)
+                    self._update_cost_stats(response, was_cached)
 
                 logger.debug(f"Got response from API: {response}")
                 end_time = time.monotonic()
@@ -487,6 +565,11 @@ class OpenAIClient:
         # setup the OpenAI configurations for this client.
         await self._setup_async_from_config(timeout=timeout)
 
+        # Avoid mutating caller-managed message history in place.
+        current_messages = self._ensure_json_keyword_in_messages(
+            current_messages, response_format
+        )
+
         # dedent the messages (field 'content' only) if needed (using textwrap)
         if dedent_messages:
             for message in current_messages:
@@ -563,6 +646,7 @@ class OpenAIClient:
                         if pre_cached_response is not None
                         else self._get_cached_response(cache_key)
                     )
+                    was_cached = cached_response is not None
 
                     if cached_response is not None:
                         response = cached_response
@@ -581,12 +665,15 @@ class OpenAIClient:
                                         self.api_cache[cache_key] = cacheable_response
                                         self._save_cache()
                                 else:
-                                    response = existing
+                                    reconstructed = self._from_cached_format(existing)
+                                    if reconstructed is not None:
+                                        response = reconstructed
+                                        was_cached = True
 
                     raw_message = self._raw_model_response_extractor(response)
 
                     # Update cost statistics
-                    self._update_cost_stats(response, cached_response is not None)
+                    self._update_cost_stats(response, was_cached)
 
                 logger.debug(f"Got response from API: {response}")
                 end_time = time.monotonic()
