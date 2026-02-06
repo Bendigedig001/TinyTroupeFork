@@ -334,7 +334,7 @@ class PersonResponse:
     persona_summary: dict[str, Any]
     raw_talk: str
     ranking: list[str]
-    borda_points: dict[str, int]
+    borda_points: Optional[dict[str, int]]
 
 
 _IMAGE_UTILS = None
@@ -598,6 +598,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Disable file persistence (always regenerate personas/answers).",
     )
     parser.add_argument(
+        "--no-borda",
+        action="store_true",
+        help="Disable Borda scoring and totals (options need not match --people count).",
+    )
+    parser.add_argument(
         "--refresh-personas",
         action="store_true",
         help="Ignore any cached personas and regenerate them.",
@@ -614,9 +619,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         _eprint("--max-workers must be >= 1")
         return 2
 
-    if args.people != 3:
+    if not args.no_borda and args.people != 3:
         print("This demo is designed for exactly 3 personas (Borda with 3 options).", file=sys.stderr)
-        print("Use `--people 3` (default).", file=sys.stderr)
+        print("Use `--people 3` (default) or pass `--no-borda` to disable Borda scoring.", file=sys.stderr)
         return 2
 
     image_defaults = ImageDefaults(
@@ -631,8 +636,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         _eprint(f"Failed to load options spec: {exc}")
         return 2
 
-    if len(option_specs) != args.people:
-        _eprint("Options count must match --people for this demo.")
+    if not args.no_borda and len(option_specs) != args.people:
+        _eprint("Options count must match --people for this demo (or use --no-borda).")
         return 2
 
     include_images_info = any(opt.images for opt in option_specs)
@@ -781,7 +786,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                             persona_summary={k: person.get(k) for k in ["age", "gender", "nationality", "residence", "education", "occupation"] if person.get(k) is not None},
                             raw_talk=raw_talk,
                             ranking=ranking,
-                            borda_points=_borda_points_for_ranking(ranking),
+                            borda_points=_borda_points_for_ranking(ranking) if not args.no_borda else None,
                         )
                     )
             else:
@@ -1007,7 +1012,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                                     persona_summary=persona_summary,
                                     raw_talk=raw_talk,
                                     ranking=ranking,
-                                    borda_points=_borda_points_for_ranking(ranking),
+                                    borda_points=_borda_points_for_ranking(ranking) if not args.no_borda else None,
                                 )
                                 if not args.quiet:
                                     _eprint(f"Ranking from {resp.name}: {resp.ranking}")
@@ -1203,7 +1208,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                                 persona_summary=persona_summary,
                                 raw_talk=raw_talk,
                                 ranking=ranking,
-                                borda_points=_borda_points_for_ranking(ranking),
+                                borda_points=_borda_points_for_ranking(ranking) if not args.no_borda else None,
                             )
                         )
 
@@ -1226,7 +1231,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         persona_summary={k: person.get(k) for k in ["age", "gender", "nationality", "residence", "education", "occupation"] if person.get(k) is not None},
                         raw_talk=raw_talk,
                         ranking=ranking,
-                        borda_points=_borda_points_for_ranking(ranking),
+                        borda_points=_borda_points_for_ranking(ranking) if not args.no_borda else None,
                     )
                 )
 
@@ -1256,11 +1261,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             except Exception:
                 pass
 
-    points_per_person = [r.borda_points for r in responses]
-    totals = _borda_totals(points_per_person, options)
-    max_total = max(totals.values()) if totals else 0
-    winners = [opt for opt, score in totals.items() if score == max_total]
-
     output = {
         "population": uk_population_sample(),
         "question": question_text,
@@ -1272,12 +1272,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "persona": r.persona_summary,
                 "output": r.raw_talk,
                 "ranking": r.ranking,
-                "borda_points": r.borda_points,
+                **({"borda_points": r.borda_points} if not args.no_borda and r.borda_points is not None else {}),
             }
             for r in responses
         ],
-        "borda_totals": totals,
-        "borda_winner": winners[0] if len(winners) == 1 else winners,
         "persistence": {
             "enabled": persist,
             "cache_dir": args.cache_dir,
@@ -1286,6 +1284,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             "answers_path": answers_path if persist else None,
         },
     }
+
+    if not args.no_borda:
+        points_per_person = [r.borda_points for r in responses if r.borda_points is not None]
+        totals = _borda_totals(points_per_person, options)
+        max_total = max(totals.values()) if totals else 0
+        winners = [opt for opt, score in totals.items() if score == max_total]
+        output["borda_totals"] = totals
+        output["borda_winner"] = winners[0] if len(winners) == 1 else winners
 
     print(json.dumps(output, indent=2, ensure_ascii=False))
     return 0

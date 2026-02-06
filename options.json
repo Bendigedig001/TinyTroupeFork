@@ -1,0 +1,31 @@
+{
+  "question": "Which screen do you prefer?",
+  "options": [
+    {
+      "id": "A",
+      "label": "Screen 1",
+      "images": [
+        {
+          "path": "screen1.png",
+          "detail": "low",
+          "max_dim": 768,
+          "format": "jpeg",
+          "quality": 85
+        }
+      ]
+    },
+    {
+      "id": "B",
+      "label": "Screen 2",
+      "images": [
+        {
+          "path": "screen2.png",
+          "detail": "low",
+          "max_dim": 768,
+          "format": "jpeg",
+          "quality": 85
+        }
+      ]
+    }
+  ]
+}
